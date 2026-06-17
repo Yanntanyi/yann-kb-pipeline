@@ -21,7 +21,7 @@ Resume support:
 
 import json
 import random
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from llm_client import LMStudioClient
 import config
@@ -143,7 +143,7 @@ Return ONLY the JSON object, no explanations."""
 
     # ── Main scoring loop ─────────────────────────────────────────────────────
 
-    def score_all_candidates(self, candidates: List[Dict]) -> List[Dict]:
+    def score_all_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Score every candidate pair, resuming from checkpoint if one exists."""
         if not candidates:
             print("No candidates to score")
@@ -237,11 +237,11 @@ Return ONLY the JSON object, no explanations."""
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def save_scored_relationships(self, relationships: List[Dict]):
+    def save_scored_relationships(self, relationships: List[Dict[str, Any]]):
         with open(self.staging_file, "w", encoding="utf-8") as f:
             json.dump(relationships, f, indent=2)
 
-    def load_scored_relationships(self) -> List[Dict]:
+    def load_scored_relationships(self) -> List[Dict[str, Any]]:
         if not self.staging_file.exists():
             return []
         with open(self.staging_file, "r", encoding="utf-8") as f:

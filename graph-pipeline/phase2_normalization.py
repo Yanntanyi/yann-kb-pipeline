@@ -19,7 +19,7 @@ Fixed in yann-pipeline:
 import copy
 import json
 from collections import defaultdict
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from llm_client import LMStudioClient
 import config
@@ -34,7 +34,7 @@ class EntityNormalizer:
 
     # ── Collection ────────────────────────────────────────────────────────────
 
-    def collect_all_entities(self, extractions: Dict[str, Dict]) -> List[str]:
+    def collect_all_entities(self, extractions: Dict[str, Any]) -> List[str]:
         """Pool every entity string from every document into one flat list."""
         all_entities = []
         for doc_data in extractions.values():
@@ -77,7 +77,7 @@ Return ONLY the JSON object, no explanations."""
             # Fallback: identity mapping so the pipeline can continue
             return {entity: entity for entity in unique_entities}
 
-    def normalize_all_entities(self, extractions: Dict[str, Dict]) -> Dict[str, str]:
+    def normalize_all_entities(self, extractions: Dict[str, Any]) -> Dict[str, str]:
         """Normalize all entities across all documents, processing in batches."""
         print("Collecting all entities...")
         all_entities = self.collect_all_entities(extractions)
@@ -98,14 +98,14 @@ Return ONLY the JSON object, no explanations."""
     # ── Canonical index ───────────────────────────────────────────────────────
 
     def build_canonical_index(
-        self, extractions: Dict[str, Dict], entity_mapping: Dict[str, str]
-    ) -> Dict[str, Dict]:
+        self, extractions: Dict[str, Any], entity_mapping: Dict[str, str]
+    ) -> Dict[str, Any]:
         """Build a map of canonical entity → {name, document_hashes, mention_count}.
 
         This index is what Phase 3 uses for weighted overlap scoring, and what
         Phase 5 uses to create Entity nodes and MENTIONS edges in Neo4j.
         """
-        canonical_index: Dict[str, Dict] = defaultdict(
+        canonical_index: Dict[str, Any] = defaultdict(
             lambda: {"canonical_name": "", "document_hashes": [], "mention_count": 0}
         )
 
@@ -123,14 +123,14 @@ Return ONLY the JSON object, no explanations."""
     # ── Apply normalization ───────────────────────────────────────────────────
 
     def apply_normalization(
-        self, extractions: Dict[str, Dict], entity_mapping: Dict[str, str]
-    ) -> Dict[str, Dict]:
+        self, extractions: Dict[str, Any], entity_mapping: Dict[str, str]
+    ) -> Dict[str, Any]:
         """Return a new extractions dict with raw entity strings replaced by canonical ones.
 
         Uses deepcopy so the original extractions dict is never mutated — the
         shallow copy in the original code caused silent in-place modification.
         """
-        normalized_extractions: Dict[str, Dict] = {}
+        normalized_extractions: Dict[str, Any] = {}
 
         for doc_hash, doc_data in extractions.items():
             normalized_data = copy.deepcopy(doc_data)

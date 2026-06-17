@@ -21,7 +21,7 @@ New in yann-pipeline:
 
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from neo4j_handler import Neo4jHandler
 import config
@@ -45,7 +45,7 @@ class GraphConstructor:
 
     # ── Threshold filtering ───────────────────────────────────────────────────
 
-    def filter_by_thresholds(self, scored_relationships: List[Dict]) -> List[Dict]:
+    def filter_by_thresholds(self, scored_relationships: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Drop relationships that don't meet quality bar before writing to Neo4j."""
         filtered = []
         for rel in scored_relationships:
@@ -63,7 +63,7 @@ class GraphConstructor:
 
     # ── Degree cap ────────────────────────────────────────────────────────────
 
-    def apply_degree_cap(self, relationships: List[Dict]) -> List[Dict]:
+    def apply_degree_cap(self, relationships: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Keep only the top MAX_DEGREE_PER_NODE strongest edges per document."""
         degree_count: Dict[str, List] = defaultdict(list)
 
@@ -87,8 +87,8 @@ class GraphConstructor:
 
     def create_graph(
         self,
-        extractions: Dict[str, Dict],
-        scored_relationships: List[Dict],
+        extractions: Dict[str, Any],
+        scored_relationships: List[Dict[str, Any]],
         canonical_index: Optional[Dict] = None,
     ):
         """Write the complete knowledge graph to Neo4j in five steps.
@@ -174,7 +174,7 @@ class GraphConstructor:
         self.print_graph_statistics()
 
     def _create_temporal_edges(
-        self, extractions: Dict[str, Dict], relationships: List[Dict]
+        self, extractions: Dict[str, Any], relationships: List[Dict[str, Any]]
     ) -> int:
         """Add PRECEDED_BY edges for related pairs where both docs have a date.
 

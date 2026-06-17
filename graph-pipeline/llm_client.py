@@ -7,6 +7,8 @@ from typing import Any, Dict
 import config
 
 
+
+
 class LMStudioClient:
     """Thin wrapper around LM Studio's /v1/chat/completions endpoint."""
 
@@ -42,3 +44,18 @@ class LMStudioClient:
             content = "\n".join(inner).strip()
 
         return json.loads(content)
+
+    def generate_text(self, prompt: str, max_tokens: int = 1024) -> str:
+        """Send a prompt and return the raw text response (no JSON parsing)."""
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()

@@ -211,7 +211,7 @@ class Neo4jHandler:
             result = session.run("MATCH (d:Document) RETURN d")
             return [record["d"] for record in result]
 
-    def query_graph(self, cypher: str, **params) -> List[Dict]:
+    def query_graph(self, cypher: str, **params) -> List[Dict[str, Any]]:
         """Execute a read-only Cypher query and return results as dicts."""
         with self.driver.session() as session:
             result = session.run(cypher, **params)

@@ -15,8 +15,7 @@ Usage:
 
 import heapq
 import sys
-import requests
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -83,7 +82,7 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
     # ── Step 2: Seed document selection ──────────────────────────────────────
 
-    def find_seed(self, query: str) -> Dict:
+    def find_seed(self, query: str) -> Dict[str, Any]:
         """Find the best starting document using TF-IDF over document topics and entities."""
         all_docs = self.neo4j.query_graph(
             "MATCH (d:Document) "
@@ -118,7 +117,7 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
     def get_neighbors(
         self, doc_hash: str, edge_types: List[str], visited: Set[str]
-    ) -> List[Dict]:
+    ) -> List[Dict[str, Any]]:
         """Return all unvisited Document neighbors reachable via the given edge types.
 
         Checks both outgoing (current→neighbor) and incoming (neighbor→current)
@@ -131,7 +130,7 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
             return []
 
         visited_list = list(visited)
-        results: Dict[str, Dict] = {}
+        results: Dict[str, Dict[str, Any]] = {}
 
         outgoing = self.neo4j.query_graph(
             """
@@ -170,7 +169,7 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
         return list(results.values())
 
-    def traverse(self, seed: Dict, intent: str) -> List[Dict]:
+    def traverse(self, seed: Dict[str, Any], intent: str) -> List[Dict[str, Any]]:
         """Best-first traversal from the seed document.
 
         Maintains a priority heap across all visited nodes. At each step, pops
@@ -233,7 +232,7 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
     # ── Step 4: Context building ──────────────────────────────────────────────
 
-    def build_context(self, path: List[Dict]) -> str:
+    def build_context(self, path: List[Dict[str, Any]]) -> str:
         """Read each document in the traversal path and prepend its edge framing."""
         sections = []
 
@@ -280,18 +279,7 @@ Instructions:
 
 Answer:"""
 
-        response = requests.post(
-            f"{config.LM_STUDIO_BASE_URL}/chat/completions",
-            json={
-                "model": config.LM_STUDIO_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 1024,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        return self.llm.generate_text(prompt)
 
     # ── Main entry point ──────────────────────────────────────────────────────
 

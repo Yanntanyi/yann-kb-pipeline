@@ -26,7 +26,7 @@ New in yann-pipeline:
 import json
 import math
 from itertools import combinations
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import config
 
@@ -90,7 +90,7 @@ class CandidateFilter:
     # ── TF-IDF semantic fallback ──────────────────────────────────────────────
 
     def build_tfidf_index(
-        self, extractions: Dict[str, Dict]
+        self, extractions: Dict[str, Any]
     ) -> Tuple:
         """Vectorise each document as its entity+topic strings for cosine similarity.
 
@@ -123,8 +123,8 @@ class CandidateFilter:
     # ── Main filtering ────────────────────────────────────────────────────────
 
     def filter_candidate_pairs(
-        self, extractions: Dict[str, Dict], canonical_index: Dict
-    ) -> List[Dict]:
+        self, extractions: Dict[str, Any], canonical_index: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
         """Evaluate all document pairs and return those passing either gate.
 
         Primary gate:   shared entity count >= MIN_ENTITY_OVERLAP
@@ -209,13 +209,13 @@ class CandidateFilter:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def save_candidates(self, candidates: List[Dict]):
+    def save_candidates(self, candidates: List[Dict[str, Any]]):
         """Save candidate pairs to staging file."""
         with open(self.staging_file, "w", encoding="utf-8") as f:
             json.dump(candidates, f, indent=2)
         print(f"Saved candidates to {self.staging_file}")
 
-    def load_candidates(self) -> List[Dict]:
+    def load_candidates(self) -> List[Dict[str, Any]]:
         """Load candidate pairs from staging file."""
         if not self.staging_file.exists():
             return []
