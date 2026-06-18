@@ -7,8 +7,9 @@ canonical index that maps each entity → the list of documents that mention it.
 Key design choices carried over from suhas-pipeline:
   - All entities are collected and normalized together (global, not per-doc)
     to prevent first-processed documents from dominating the vocabulary
-  - Batch size of 100 keeps prompts within context limits while still
-    catching aliases that appear across documents
+  - Small batches keep each JSON response under the model's output-token
+    ceiling (important for reasoning models like gpt-oss) while still catching
+    aliases that appear across documents
 
 Fixed in yann-pipeline:
   - apply_normalization used doc_data.copy() which is a shallow copy — writing
@@ -83,7 +84,11 @@ Return ONLY the JSON object, no explanations."""
         all_entities = self.collect_all_entities(extractions)
         print(f"Found {len(all_entities)} total entity mentions")
 
-        batch_size = 100
+        # Small batches keep each JSON response well under the model's token
+        # ceiling. This matters for reasoning models (gpt-oss): they spend tokens
+        # thinking before emitting the mapping, so a large batch can overflow the
+        # output limit and come back empty (finish_reason="length").
+        batch_size = 30
         entity_mapping: Dict[str, str] = {}
 
         for i in range(0, len(all_entities), batch_size):
