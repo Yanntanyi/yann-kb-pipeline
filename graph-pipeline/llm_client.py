@@ -153,9 +153,10 @@ class WatsonxClient:
             )
             response.raise_for_status()
             payload = response.json()
-            self._token = payload["access_token"]
+            token = payload["access_token"]
+            self._token = token
             self._token_expiry = time.time() + payload.get("expires_in", 3600)
-            return self._token
+            return token
 
     # ── Core request ──────────────────────────────────────────────────────
 
