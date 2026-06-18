@@ -163,7 +163,9 @@ class WatsonxClient:
     def _chat(self, prompt: str, max_tokens: int, temperature: float = 0.1) -> str:
         """POST one user-turn chat completion and return the message content.
 
-        Retries once on a 401 in case the token expired mid-flight.
+        Retries on a 401 (expired token) and on 429/5xx (rate-limit or transient
+        server error) with exponential backoff. The backoff matters when many
+        calls run concurrently (e.g. Phase 4), where rate-limits are likely.
         """
         url = f"{self.base_url}/ml/v1/text/chat?version={self.api_version}"
         body = {
@@ -174,7 +176,8 @@ class WatsonxClient:
             "temperature": temperature,
         }
 
-        for attempt in range(2):
+        max_attempts = 5
+        for attempt in range(max_attempts):
             headers = {
                 "Authorization": f"Bearer {self._get_token()}",
                 "Content-Type": "application/json",
@@ -182,10 +185,15 @@ class WatsonxClient:
             }
             response = requests.post(url, headers=headers, json=body, timeout=300)
 
-            if response.status_code == 401 and attempt == 0:
-                # Force a token refresh and retry once.
+            if response.status_code == 401 and attempt < max_attempts - 1:
+                # Token expired mid-flight — force a refresh and retry.
                 with self._token_lock:
                     self._token = None
+                continue
+
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                # Rate-limited or transient server error — back off and retry.
+                time.sleep(min(2 ** attempt, 30))
                 continue
 
             response.raise_for_status()
@@ -204,8 +212,8 @@ class WatsonxClient:
                 )
             return content.strip()
 
-        # Unreachable: the loop either returns or raises.
-        raise RuntimeError("watsonx chat request failed after retry")
+        # Exhausted retries on a retryable status.
+        raise RuntimeError("watsonx chat request failed after retries")
 
     def generate_json(self, prompt: str) -> Dict[str, Any]:
         """Send a prompt and return the response parsed as a JSON dict."""
