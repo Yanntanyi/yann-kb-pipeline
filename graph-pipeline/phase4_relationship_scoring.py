@@ -21,7 +21,9 @@ Resume support:
 
 import json
 import random
-from typing import Any, Dict, List
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
 
 from llm_client import get_llm_client
 import config
@@ -141,10 +143,51 @@ Return ONLY the JSON object, no explanations."""
                 "confidence": "low",
             }
 
+    def _score_candidate(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Read both documents and score their relationship, returning the full
+        result record (or None if a document could not be read).
+
+        Runs in worker threads, so it only touches per-call state and the shared
+        (thread-safe) LLM client — no shared mutable collections.
+        """
+        try:
+            doc1_content = self.read_document(candidate["filepath1"])
+            doc2_content = self.read_document(candidate["filepath2"])
+        except Exception as e:
+            print(f"  Error reading {candidate['filepath1']} / {candidate['filepath2']}: {e}")
+            return None
+
+        score_result = self.score_relationship(
+            doc1_content,
+            doc2_content,
+            candidate["filepath1"],
+            candidate["filepath2"],
+            candidate["shared_entities"],
+        )
+
+        return {
+            "hash1": candidate["hash1"],
+            "hash2": candidate["hash2"],
+            "filepath1": candidate["filepath1"],
+            "filepath2": candidate["filepath2"],
+            "overlap_score": candidate["overlap_score"],
+            "semantic_score": candidate.get("semantic_score", 0.0),
+            "shared_entities": candidate["shared_entities"],
+            "gate": candidate.get("gate", "entity"),
+            "relationship": score_result,
+        }
+
     # ── Main scoring loop ─────────────────────────────────────────────────────
 
     def score_all_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Score every candidate pair, resuming from checkpoint if one exists."""
+        """Score every candidate pair concurrently, resuming from checkpoint.
+
+        Each pair is one LLM call. A thread pool runs PHASE4_CONCURRENCY of them
+        in parallel, which is what turns a many-hour sequential run into a
+        fraction of the time. Results are collected and checkpointed under a lock
+        as each pair finishes, so resume support and the every-N-pairs save are
+        preserved exactly as before.
+        """
         if not candidates:
             print("No candidates to score")
             return []
@@ -175,62 +218,61 @@ Return ONLY the JSON object, no explanations."""
         else:
             print(f"Scoring {len(candidates)} candidate pairs...")
 
-        print(f"Progress saved every {SAVE_INTERVAL} pairs\n")
+        concurrency = max(1, config.PHASE4_CONCURRENCY)
+        print(
+            f"Concurrency: {concurrency} workers | "
+            f"progress saved every {SAVE_INTERVAL} pairs\n"
+        )
 
         random.shuffle(remaining)
 
-        for idx, candidate in enumerate(remaining, 1):
-            global_idx = len(already_scored) + idx
-            print(
-                f"Scoring pair {global_idx}/{len(candidates)}: "
-                f"{candidate['filepath1']} <-> {candidate['filepath2']}"
-            )
+        lock = threading.Lock()
+        completed = 0
+        total = len(candidates)
 
-            try:
-                doc1_content = self.read_document(candidate["filepath1"])
-                doc2_content = self.read_document(candidate["filepath2"])
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(self._score_candidate, c): c for c in remaining
+            }
 
-                score_result = self.score_relationship(
-                    doc1_content,
-                    doc2_content,
-                    candidate["filepath1"],
-                    candidate["filepath2"],
-                    candidate["shared_entities"],
-                )
+            for future in as_completed(futures):
+                candidate = futures[future]
+                try:
+                    record = future.result()
+                except Exception as e:
+                    print(
+                        f"  Error processing pair "
+                        f"{candidate['filepath1']} <-> {candidate['filepath2']}: {e}"
+                    )
+                    continue
 
-                rel_type = score_result["relationship_type"]
-                if rel_type != "NONE":
-                    valid_count += 1
-                else:
-                    none_count += 1
+                if record is None:
+                    continue
 
-                scored_relationships.append(
-                    {
-                        "hash1": candidate["hash1"],
-                        "hash2": candidate["hash2"],
-                        "filepath1": candidate["filepath1"],
-                        "filepath2": candidate["filepath2"],
-                        "overlap_score": candidate["overlap_score"],
-                        "semantic_score": candidate.get("semantic_score", 0.0),
-                        "shared_entities": candidate["shared_entities"],
-                        "gate": candidate.get("gate", "entity"),
-                        "relationship": score_result,
-                    }
-                )
+                # Collecting results, counters, and checkpoints happen under the
+                # lock so concurrent completions can't corrupt shared state.
+                with lock:
+                    scored_relationships.append(record)
+                    rel_type = record["relationship"]["relationship_type"]
+                    if rel_type != "NONE":
+                        valid_count += 1
+                    else:
+                        none_count += 1
 
-                print(
-                    f"  {rel_type} | strength: {score_result['strength']}/10 | "
-                    f"confidence: {score_result['confidence']} | "
-                    f"running valid/NONE: {valid_count}/{none_count}"
-                )
+                    completed += 1
+                    global_idx = len(already_scored) + completed
 
-            except Exception as e:
-                print(f"  Error processing pair: {str(e)}")
-                continue
+                    print(
+                        f"[{global_idx}/{total}] "
+                        f"{record['filepath1']} <-> {record['filepath2']}\n"
+                        f"  {rel_type} | strength: {record['relationship']['strength']}/10 | "
+                        f"confidence: {record['relationship']['confidence']} | "
+                        f"running valid/NONE: {valid_count}/{none_count}"
+                    )
 
-            if idx % SAVE_INTERVAL == 0:
-                self.save_scored_relationships(scored_relationships)
-                print(f"  [checkpoint] Saved {len(scored_relationships)} pairs so far")
+                    if completed % SAVE_INTERVAL == 0:
+                        self.save_scored_relationships(scored_relationships)
+                        print(f"  [checkpoint] Saved {len(scored_relationships)} pairs so far")
 
         self.save_scored_relationships(scored_relationships)
         return scored_relationships
