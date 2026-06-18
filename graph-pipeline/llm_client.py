@@ -54,7 +54,7 @@ class LMStudioClient:
         self.base_url = config.LM_STUDIO_BASE_URL
         self.model = config.LM_STUDIO_MODEL
 
-    def generate_json(self, prompt: str) -> Dict[str, Any]:
+    def generate_json(self, prompt: str, max_tokens: int = 4096) -> Dict[str, Any]:
         """Send a prompt and return the response parsed as a JSON dict."""
         response = requests.post(
             f"{self.base_url}/chat/completions",
@@ -62,7 +62,7 @@ class LMStudioClient:
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
-                "max_tokens": 2048,
+                "max_tokens": max_tokens,
             },
             timeout=120,
         )
@@ -215,9 +215,16 @@ class WatsonxClient:
         # Exhausted retries on a retryable status.
         raise RuntimeError("watsonx chat request failed after retries")
 
-    def generate_json(self, prompt: str) -> Dict[str, Any]:
-        """Send a prompt and return the response parsed as a JSON dict."""
-        content = self._chat(prompt, max_tokens=2048)
+    def generate_json(self, prompt: str, max_tokens: int = 4096) -> Dict[str, Any]:
+        """Send a prompt and return the response parsed as a JSON dict.
+
+        Default budget is generous because gpt-oss is a reasoning model: it
+        spends tokens "thinking" before the JSON, so a small ceiling can truncate
+        the output to empty (finish_reason="length"). Callers producing large
+        JSON (e.g. Phase 2 batches) should keep their batch small rather than
+        relying on an ever-larger ceiling.
+        """
+        content = self._chat(prompt, max_tokens=max_tokens)
         return _extract_json_object(content)
 
     def generate_text(self, prompt: str, max_tokens: int = 2048) -> str:
