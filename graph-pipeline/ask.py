@@ -22,13 +22,14 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from neo4j_handler import Neo4jHandler
-from llm_client import LMStudioClient
+from es_handler import ElasticsearchHandler
+from llm_client import get_llm_client
 import config
 
 # ── Traversal parameters ──────────────────────────────────────────────────────
 
-MAX_DOCS = 5   # maximum documents to collect before stopping
-MAX_HOPS = 4   # maximum hops from the seed document
+MAX_DOCS = 6   # maximum documents to collect (config.NUM_SEEDS anchors + graph hops)
+MAX_HOPS = 4   # maximum graph edges followed beyond the seeds
 
 # Ordered edge type priorities per query intent.
 # Index in the list = priority rank (lower index = follow first).
@@ -53,7 +54,8 @@ class KnowledgeGraphQuerier:
 
     def __init__(self):
         self.neo4j = Neo4jHandler()
-        self.llm = LMStudioClient()
+        self.llm = get_llm_client()
+        self.es = ElasticsearchHandler() if config.ES_ENABLED else None
 
     # ── Step 1: Intent classification ────────────────────────────────────────
 
@@ -82,8 +84,31 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
     # ── Step 2: Seed document selection ──────────────────────────────────────
 
-    def find_seed(self, query: str) -> Dict[str, Any]:
-        """Find the best starting document using TF-IDF over document topics and entities."""
+    def find_seeds(self, query: str) -> List[Dict[str, Any]]:
+        """Return the top NUM_SEEDS starting documents for traversal.
+
+        Primary path is Elasticsearch hybrid retrieval (BM25 + dense kNN fused
+        with RRF). Using several seeds instead of one makes traversal robust to
+        a single bad seed. Falls back to a single TF-IDF seed if ES is disabled,
+        unreachable, or returns nothing.
+        """
+        if self.es is not None:
+            try:
+                query_vector = None
+                if config.ES_USE_DENSE:
+                    query_vector = self.llm.embed([query])[0]
+
+                seeds = self.es.hybrid_search(query, query_vector, size=config.NUM_SEEDS)
+                if seeds:
+                    return seeds
+                print("  ES returned no hits — falling back to TF-IDF seed.")
+            except Exception as e:
+                print(f"  ES seed retrieval failed ({e}); falling back to TF-IDF seed.")
+
+        return [self._find_seed_tfidf(query)]
+
+    def _find_seed_tfidf(self, query: str) -> Dict[str, Any]:
+        """Fallback: single best seed via TF-IDF over document topics and entities."""
         all_docs = self.neo4j.query_graph(
             "MATCH (d:Document) "
             "RETURN d.hash as hash, d.filepath as filepath, "
@@ -111,7 +136,8 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
         similarities = cosine_similarity(query_vec, doc_vecs)[0]
 
         best_idx = int(np.argmax(similarities))
-        return all_docs[best_idx]
+        best = all_docs[best_idx]
+        return {"hash": best["hash"], "filepath": best["filepath"]}
 
     # ── Step 3: Graph traversal ───────────────────────────────────────────────
 
@@ -169,38 +195,51 @@ Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "simi
 
         return list(results.values())
 
-    def traverse(self, seed: Dict[str, Any], intent: str) -> List[Dict[str, Any]]:
-        """Best-first traversal from the seed document.
+    def traverse(self, seeds: List[Dict[str, Any]], intent: str) -> List[Dict[str, Any]]:
+        """Best-first traversal from one or more seed documents.
 
-        Maintains a priority heap across all visited nodes. At each step, pops
-        the globally best available edge (by intent priority rank, then strength)
-        and follows it to an unvisited neighbor. Continues until MAX_DOCS
-        documents are collected or no qualifying edges remain.
+        All retrieved seeds become traversal anchors. A single priority heap
+        spans every visited node; at each step the globally best available edge
+        (by intent priority rank, then strength) is popped and followed to an
+        unvisited neighbor — so a strong edge discovered from any anchor competes
+        with edges from every other. Continues until MAX_DOCS documents are
+        collected or no qualifying edges remain.
 
         Returns an ordered list of dicts: {hash, filepath, edge_description}.
-        edge_description is None for the seed (no edge led there).
+        edge_description is None for seeds (they were retrieved, not followed).
         """
         edge_types = EDGE_PRIORITIES.get(intent, [])
         priority_rank = {etype: i for i, etype in enumerate(edge_types)}
 
-        visited: Set[str] = {seed["hash"]}
-        path = [
-            {
-                "hash": seed["hash"],
-                "filepath": seed["filepath"],
-                "edge_description": None,
-            }
-        ]
+        visited: Set[str] = set()
+        path: List[Dict[str, Any]] = []
+
+        # Seeds anchor the path in retrieval-rank order, deduplicated.
+        for seed in seeds:
+            if seed["hash"] in visited:
+                continue
+            visited.add(seed["hash"])
+            path.append(
+                {
+                    "hash": seed["hash"],
+                    "filepath": seed["filepath"],
+                    "edge_description": None,
+                }
+            )
+            if len(path) >= MAX_DOCS:
+                return path
 
         # Heap entries: (rank, -strength, counter, neighbor_dict)
         # counter breaks ties without comparing dicts
         heap: list = []
         counter = 0
 
-        for neighbor in self.get_neighbors(seed["hash"], edge_types, visited):
-            rank = priority_rank.get(neighbor["rel_type"], 999)
-            heapq.heappush(heap, (rank, -neighbor["strength"], counter, neighbor))
-            counter += 1
+        # Seed the frontier with the graph neighbors of every anchor.
+        for anchor in path:
+            for neighbor in self.get_neighbors(anchor["hash"], edge_types, visited):
+                rank = priority_rank.get(neighbor["rel_type"], 999)
+                heapq.heappush(heap, (rank, -neighbor["strength"], counter, neighbor))
+                counter += 1
 
         hops = 0
         while heap and len(path) < MAX_DOCS and hops < MAX_HOPS:
@@ -292,12 +331,14 @@ Answer:"""
         print(f"Intent: {intent} ({INTENT_DESCRIPTIONS[intent]})")
         print(f"Edge priority: {' → '.join(EDGE_PRIORITIES[intent])}")
 
-        # Step 2: Seed
-        seed = self.find_seed(query)
-        print(f"\nSeed document: {seed['filepath']}")
+        # Step 2: Seeds
+        seeds = self.find_seeds(query)
+        print(f"\nSeed documents ({len(seeds)}):")
+        for seed in seeds:
+            print(f"  - {seed['filepath']}")
 
         # Step 3: Traverse
-        path = self.traverse(seed, intent)
+        path = self.traverse(seeds, intent)
         print(f"\nTraversal path ({len(path)} documents):")
         for i, node in enumerate(path):
             prefix = "  seed" if i == 0 else f"  hop {i}"

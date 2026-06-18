@@ -19,7 +19,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict
 
-from llm_client import LMStudioClient
+from llm_client import get_llm_client
 import config
 
 
@@ -27,7 +27,7 @@ class DocumentExtractor:
     """Extract semantic fingerprints from documents independently."""
 
     def __init__(self):
-        self.llm = LMStudioClient()
+        self.llm = get_llm_client()
         self.staging_file = config.STAGING_DIR / "phase1_extractions.json"
 
     def compute_hash(self, content: str) -> str:

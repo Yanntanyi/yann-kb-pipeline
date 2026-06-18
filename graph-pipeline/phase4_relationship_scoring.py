@@ -23,7 +23,7 @@ import json
 import random
 from typing import Any, Dict, List
 
-from llm_client import LMStudioClient
+from llm_client import get_llm_client
 import config
 
 SAVE_INTERVAL = 10
@@ -33,7 +33,7 @@ class RelationshipScorer:
     """Score relationships between candidate document pairs using the LLM."""
 
     def __init__(self):
-        self.llm = LMStudioClient()
+        self.llm = get_llm_client()
         self.staging_file = config.STAGING_DIR / "phase4_scored_relationships.json"
 
     # ── Document reading ──────────────────────────────────────────────────────
