@@ -70,7 +70,7 @@ class LMStudioClient:
         content = response.json()["choices"][0]["message"]["content"]
         return _extract_json_object(content)
 
-    def generate_text(self, prompt: str, max_tokens: int = 1024) -> str:
+    def generate_text(self, prompt: str, max_tokens: int = 2048) -> str:
         """Send a prompt and return the raw text response (no JSON parsing)."""
         response = requests.post(
             f"{self.base_url}/chat/completions",
@@ -189,7 +189,20 @@ class WatsonxClient:
                 continue
 
             response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
+            choice = response.json()["choices"][0]
+            content = (choice.get("message") or {}).get("content")
+            if not content:
+                # gpt-oss is a reasoning model: it emits a hidden
+                # `reasoning_content` channel before the final `content`. If
+                # max_tokens is too small the reasoning consumes the whole
+                # budget and `content` comes back empty (finish_reason="length").
+                # Fail clearly instead of KeyError-ing downstream.
+                raise RuntimeError(
+                    "watsonx returned empty message content "
+                    f"(finish_reason={choice.get('finish_reason')!r}). "
+                    "For reasoning models like gpt-oss, increase max_tokens."
+                )
+            return content.strip()
 
         # Unreachable: the loop either returns or raises.
         raise RuntimeError("watsonx chat request failed after retry")
@@ -199,7 +212,7 @@ class WatsonxClient:
         content = self._chat(prompt, max_tokens=2048)
         return _extract_json_object(content)
 
-    def generate_text(self, prompt: str, max_tokens: int = 1024) -> str:
+    def generate_text(self, prompt: str, max_tokens: int = 2048) -> str:
         """Send a prompt and return the raw text response (no JSON parsing)."""
         return self._chat(prompt, max_tokens=max_tokens)
 
