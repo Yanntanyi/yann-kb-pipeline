@@ -3,6 +3,18 @@
 import os
 from pathlib import Path
 
+
+def _env(*names: str, default: str = "") -> str:
+    """Return the first non-empty value among the given environment variables,
+    or `default`. Lets a setting accept several env var names (e.g. both
+    WATSONX_* and REPORT_WATSONX_*)."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
 # Root of the UPS-Watson-Knowledge-Base repo
 BASE_DIR = Path(__file__).parent.parent
 
@@ -39,6 +51,12 @@ MIN_RELATIONSHIP_STRENGTH = 4
 # Maximum edges per document node — prevents one doc from dominating the graph
 MAX_DEGREE_PER_NODE = 10
 
+# Number of candidate pairs scored concurrently in Phase 4. Each pair is one
+# LLM call; scoring them in parallel turns a many-hour sequential run into a
+# fraction of the time. Lower this if the LLM endpoint returns rate-limit (429)
+# errors faster than the client's backoff can absorb.
+PHASE4_CONCURRENCY = int(_env("PHASE4_CONCURRENCY", default="8"))
+
 # ── LLM provider ───────────────────────────────────────────────────────────────
 # Which backend the whole pipeline uses: "watsonx" (gpt-oss via watsonx.ai)
 # or "lmstudio" (local LM Studio). get_llm_client() reads this.
@@ -52,13 +70,6 @@ LM_STUDIO_MODEL = "ibm/granite-4.1-8b"
 # ── watsonx.ai ─────────────────────────────────────────────────────────────────
 # Values are read from the environment first, falling back to defaults below.
 # Both WATSONX_* and REPORT_WATSONX_* env var names are accepted.
-def _env(*names: str, default: str = "") -> str:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return default
-
 # Region host — NOT the IAM host. The chat endpoint is appended by the client.
 WATSONX_BASE_URL = _env(
     "WATSONX_BASE_URL", "REPORT_WATSONX_BASE_URL",
