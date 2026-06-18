@@ -1,296 +1,193 @@
 # UPS Watson Incident Intelligence: Architecture
 
----
-
-## The Problem
-
-Every time there's a cloud infrastructure incident at UPS, engineers write an RCA (Root Cause Analysis). Every controlled change goes through a Change Request. Over time you accumulate hundreds of these documents — but they just sit in folders.
-
-When a new incident hits, nobody knows if this exact problem happened six months ago, which services were involved, who approved the last change to that component, or whether a recent CR is what triggered the outage. You're starting from zero every single time.
+*What the system is, how it's split into pieces, and — file by file — what every piece of code does and why it's built that way. For the deep dive on how a question is actually answered, see [traversal.md](traversal.md); this document is the map of the whole codebase.*
 
 ---
 
-## Why Not Just RAG
+## 1. The problem
 
-The obvious first answer is RAG — dump the documents into a search engine and ask questions. The problem is that standard RAG only finds documents that match your words. It doesn't understand that zen-minio and the memory alerts and the IBM EM team are all part of the same story. It understands words, not relationships.
+Every cloud incident at UPS produces an **RCA** (Root Cause Analysis). Every controlled change produces a **Change Request (CR)**. Over time you accumulate hundreds of these documents sitting in folders. When a new incident hits, nobody can quickly answer: *Has this happened before? Which change caused it? What was done to fix the last one? What else broke that week?* You start from zero every time.
 
-A concrete example: the CPD certificate RCA and the cert update CR both mention IBM EM Team and OpenShift. A keyword search finds both when you search "IBM EM." But it has no idea that one is a change request that was executed and the other is a post-incident report written the same day because that change caused an outage. The relationship — and the causal direction — is invisible.
-
-Even a basic graph RAG approach doesn't fully solve this. You can retrieve the top N documents by similarity, dump them into the LLM, and let it sort out the connections. But you're still treating every retrieved document equally, regardless of what kind of information it contains or how it connects to the question. The graph is stored but never actually used during retrieval.
-
-What we need is a system that understands both the content of documents and the connections between them, and uses those connections to navigate to the right answer.
+We want a system that can answer those questions by **understanding both what each document says and how the documents connect to each other.**
 
 ---
 
-## What We Built
+## 2. Why not just plain RAG
 
-The system has two parts: a **5-phase pipeline** that reads and understands every document and constructs a knowledge graph in Neo4j, and a **traversal engine** (`ask.py`) that queries that graph using the structure of the connections themselves — not just keyword similarity.
-
-### The Knowledge Graph
-
-Neo4j stores two types of nodes:
-
-| Node type | What it represents | Example |
-|-----------|-------------------|---------|
-| `Document` | A single CR or RCA file | `CR/20251111-Update-CPD-Routes.md` |
-| `Entity` | Any named thing extracted from the docs — a service, team, cluster, or concept | `IBM EM Team (Organization)`, `zen-minio (Technology)` |
-
-And **9 edge types** across three categories:
-
-**Semantic edges (Document → Document)** — scored by the LLM in Phase 4:
-
-| Edge | Meaning |
-|------|---------|
-| `EXTENDS` | One document builds upon or extends concepts from the other |
-| `CONTRADICTS` | The documents present conflicting information |
-| `SUPPORTS` | One document corroborates the findings of the other |
-| `REFERENCES` | One document explicitly cites or links to the other |
-| `PROVIDES_CONTEXT_FOR` | One document gives the background needed to understand the other |
-| `SHARES_DOMAIN_WITH` | Same domain or technology area, no direct relationship |
-| `IMPLEMENTS` | One document is the action taken as a result of the other |
-
-**Structural edge (Document → Entity):**
-
-| Edge | Meaning |
-|------|---------|
-| `MENTIONS` | This document references this entity |
-
-**Temporal edge (Document → Document):**
-
-| Edge | Meaning |
-|------|---------|
-| `PRECEDED_BY` | This document is dated earlier than the other |
-
-Every semantic edge stores four properties beyond its type: a **strength** score (1–10), a **confidence** level, a **directionality**, and a **description**. The description is the most important — it is a natural-language sentence written specifically to explain, from the perspective of someone who just read the source document, what they will find in the destination document and why following this edge is worth doing. This description is what the traversal engine uses as framing when it retrieves a neighbor.
+The obvious approach — embed the question, grab the most similar documents, hand them to an LLM — fails here in two ways: it's **blind to structure** (it can't tell that one document *caused* another; that fact lives in the relationship, not the text) and it's **trapped by vocabulary** (it misses a directly-relevant document that happens to use different words). The fix is to make the **connections between documents** the actual search mechanism. The full argument is in [traversal.md §2](traversal.md); here we just note that this is *why* the system is shaped the way it is.
 
 ---
 
-## The 5-Phase Pipeline
-
-Every phase saves its output to `graph-pipeline/staging/` as a JSON file. This means you can resume from any phase without re-running the expensive ones before it. If Phase 4 is interrupted, it resumes from its last checkpoint rather than starting over.
-
----
-
-### Phase 1 — Independent Extraction (`phase1_extraction.py`)
-
-Reads every `.md` file under `docs/CR/` and `docs/RCA/` and asks the LLM to extract a structured fingerprint from each document **in isolation** — no document sees another yet.
-
-Each document produces:
-```json
-{
-  "entities": ["zen-minio (Technology)", "IBM EM Team (Organization)", ...],
-  "topics":   ["memory management", "openshift configuration"],
-  "stance":   "instructional",
-  "date":     "2025-02-13"
-}
-```
-
-**Why isolation?** If documents were processed together, the first documents processed would anchor the vocabulary. Every entity name extracted later would be implicitly compared against those early examples. By processing each document independently and normalizing in Phase 2, we prevent any document from having a disproportionate influence on how entities are named.
-
-**Why only CR/ and RCA/?** The pipeline explicitly ingests only from these two subdirectories. READMEs, index files, templates, and setup guides are excluded. The graph should contain only source-of-truth incident documents.
-
-Saves to: `staging/phase1_extractions.json`
-
----
-
-### Phase 2 — Global Entity Normalization (`phase2_normalization.py`)
-
-Collects every entity string from every document into one pool and sends them to the LLM in batches to resolve aliases into canonical forms:
+## 3. The system in two halves (plus its infrastructure)
 
 ```
-"IBM EM"        →  "IBM EM Team (Organization)"
-"the EM team"   →  "IBM EM Team (Organization)"
-"EM Team"       →  "IBM EM Team (Organization)"
+                     BUILD TIME (once, then on new docs)
+   docs/CR + docs/RCA ──► [5-phase pipeline] ──► Knowledge graph in Neo4j
+                                                        │
+                                                        ▼
+                                              [index_es.py] ──► Elasticsearch
+                                                                  (search index)
+   ─────────────────────────────────────────────────────────────────────────
+                     QUERY TIME (every question)
+   your question ──► [ask.py] ──► seeds from Elasticsearch
+                                ──► walk the graph in Neo4j
+                                ──► grounded answer from the LLM
 ```
 
-It also builds a **canonical index** — a map of every canonical entity to the list of documents that mention it, which Phase 3 uses for overlap scoring and Phase 5 uses to create Entity nodes.
+- **The build pipeline** (`main.py` + `phase1`–`phase5`) reads every document and constructs the graph in Neo4j. Expensive, run rarely.
+- **The query engine** (`ask.py`) answers questions by walking that graph. Cheap, run constantly.
+- **Three external systems** support both: **Neo4j** (stores the graph), **Elasticsearch** (finds where to start a query), and **an LLM** (gpt-oss on watsonx, or local Granite) for the reading/judging/writing.
 
-**Why global normalization?** If each document normalized its own entities independently, "IBM EM Team" and "EM Team" would never be recognized as the same thing across two documents. Normalization only works if it sees all entity strings at once.
-
-Saves to: `staging/phase2_normalized_entities.json`
-
----
-
-### Phase 3 — Candidate Filtering (`phase3_candidate_filtering.py`)
-
-With ~294 documents, a naive all-pairs comparison would mean ~43,000 LLM calls in Phase 4. Phase 3 reduces this to a manageable candidate list using two gates:
-
-**Primary gate — entity overlap:**
-A document pair passes if they share at least `MIN_ENTITY_OVERLAP` canonical entities, weighted by specificity — an entity appearing in only 2 documents is a much stronger signal than one appearing in 100.
-
-**Secondary gate — semantic similarity (TF-IDF fallback):**
-If a pair fails the entity gate but scores above `MIN_SEMANTIC_SIMILARITY` on TF-IDF cosine similarity of their entity+topic text, it still becomes a candidate. This catches cases where two documents describe the same thing using different terminology that Phase 2 normalization didn't unify.
-
-Saves to: `staging/phase3_candidate_pairs.json`
+The rest of this document walks every file.
 
 ---
 
-### Phase 4 — Pairwise LLM Scoring (`phase4_relationship_scoring.py`)
+## 4. The data model (what's in the graph)
 
-For each candidate pair, reads both full documents and asks the LLM to score their relationship. The critical output is the **description** field:
+Two kinds of **nodes**:
 
-```json
-{
-  "relationship_type": "PROVIDES_CONTEXT_FOR",
-  "strength":          8,
-  "description":       "Document 2 is the cert update CR executed one day before the voice outage in Document 1 — it contains the specific implementation steps and approval chain for the change that caused the incident.",
-  "directionality":    "doc2_to_doc1",
-  "confidence":        "high"
-}
-```
+| Node | Represents | Example |
+|---|---|---|
+| `Document` | One CR or RCA file | `CR/20251111-Update-CPD-Routes.md` |
+| `Entity` | A named thing (service, team, cluster, concept) | `IBM EM Team (Organization)` |
 
-The description is written from the perspective of someone who just finished reading the source document and is deciding whether to follow this edge. It names the actual components, incidents, and decisions involved — not a generic summary. This is what the traversal engine prepends as framing when it retrieves a neighbor document.
-
-**Why full documents?** An RCA tells a story — splitting it into chunks risks cutting the cause from the resolution. The LLM needs to see the whole narrative to correctly judge whether two documents are causally related.
-
-**Resume support:** Results are checkpointed every 10 pairs. If the run is interrupted, restarting from Phase 4 loads the checkpoint and skips already-scored pairs rather than starting over.
-
-Saves to: `staging/phase4_scored_relationships.json`
+The **edges** carry the meaning. Document→Document semantic edges (`EXTENDS`, `CONTRADICTS`, `SUPPORTS`, `REFERENCES`, `PROVIDES_CONTEXT_FOR`, `SHARES_DOMAIN_WITH`, `IMPLEMENTS`) are scored by the LLM in Phase 4 and each carries a **strength (1–10)**, a **confidence**, a **directionality**, and a one-sentence **description** explaining why the link matters. A `MENTIONS` edge connects a Document to each Entity it references. A `PRECEDED_BY` edge connects two dated, related documents in time order. (What each edge *means* and how traversal uses it is in [traversal.md §3 and §6](traversal.md).)
 
 ---
 
-### Phase 5 — Graph Construction (`phase5_graph_construction.py`)
+## 5. Foundation files (shared by everything)
 
-Takes everything from previous phases and writes the final graph to Neo4j:
+### `config.py` — the single control panel
+Every tunable lives here: ingest paths, the Phase 3/4/5 thresholds, the LLM provider switch, watsonx + LM Studio settings, embedding model + dimension, Elasticsearch settings, seed count, and Neo4j credentials. A small `_env()` helper reads each setting from an environment variable (accepting both `WATSONX_*` and `REPORT_WATSONX_*` names) and falls back to a sensible default.
 
-1. **Filter by quality thresholds:** Drops any relationship scored `NONE`, below `MIN_RELATIONSHIP_STRENGTH`, or with `low` confidence.
-2. **Apply degree cap:** For each document, keeps only its top `MAX_DEGREE_PER_NODE` strongest connections, preventing any one document from dominating graph traversal.
-3. **Create Document nodes:** One node per unique document, storing filepath, entities, topics, stance, and date.
-4. **Create Entity nodes + MENTIONS edges:** Every canonical entity becomes a real Neo4j node. Every document gets a `MENTIONS` edge to each entity it references, making entity-based graph queries a traversal rather than a property scan.
-5. **Create PRECEDED_BY temporal edges:** For each related document pair where both documents have a date, creates a directed `PRECEDED_BY` edge from the earlier to the later, with `days_apart` stored on the edge.
+**Why it's built this way:** putting every knob in one file means you change *behavior* without touching *logic*, and the env-var support is what makes the "write code on one laptop, run it on another" workflow painless — you set keys in the environment, not in source.
 
-Saves to: Neo4j (live graph)
+### `llm_client.py` — one LLM interface, two backends
+Defines two clients that expose the **same three methods** — `generate_json()`, `generate_text()`, `embed()` — so nothing else in the codebase knows or cares which LLM is in use:
 
----
+- **`WatsonxClient`** talks to IBM watsonx.ai (default; runs `gpt-oss-120b`). watsonx is *not* OpenAI-compatible, so this class handles the things that make it work: exchanging your API key for an **IAM bearer token** and caching it (refreshing ~1 min before it expires, behind a lock so parallel calls are safe), building the watsonx-specific request body (`model_id` + `project_id`), and **retrying** on expired-token (401) and rate-limit/transient (429/5xx) errors with exponential backoff.
+- **`LMStudioClient`** talks to a local LM Studio server (e.g. Granite). Free, offline, OpenAI-style.
+- **`get_llm_client()`** returns whichever one `config.LLM_PROVIDER` selects.
 
-## The Traversal Engine (`ask.py`)
+Two details exist specifically because gpt-oss is a **reasoning model**: `_extract_json_object()` tolerates a model that wraps its JSON in prose, and `_chat()` raises a clear "empty content — increase max_tokens" error instead of crashing cryptically when the model spends its whole token budget thinking. (Both were added after we hit exactly those failures.)
 
-The pipeline builds the graph. `ask.py` is how you query it.
+**Why it's built this way:** the unified interface means swapping the entire system between cloud gpt-oss and local Granite is a one-flag change (`LLM_PROVIDER`). The retry/backoff logic is what makes Phase 4's parallelism safe. The reasoning-model handling is hard-won.
 
-The key difference from standard RAG: instead of retrieving the top N documents by embedding similarity and dumping them into the LLM, the traversal engine uses the structure and semantics of the graph edges to navigate to the right documents. The edge types are not metadata — they are the retrieval mechanism.
+### `neo4j_handler.py` — the graph database wrapper
+Wraps the Neo4j driver with one method per operation: create Document/Entity nodes, create relationship/MENTIONS/PRECEDED_BY edges, run read queries (`query_graph`), and set up schema constraints. Every write uses `MERGE`.
 
-### Step 1 — Classify the Query Intent
+**Why it's built this way:** `MERGE` makes the whole pipeline **idempotent** — you can re-run any phase without creating duplicate nodes or edges. And the relationship type is **whitelisted** before being put into a query string (Neo4j can't accept a relationship type as a safe parameter), which prevents injection without needing the APOC plugin.
 
-One LLM call classifies what kind of question is being asked:
+### `es_handler.py` — the hybrid search engine
+A thin REST wrapper around Elasticsearch (using plain `requests`, no extra dependency). It builds the index (BM25 text fields + an optional dense-vector field sized to `EMBEDDING_DIM`), bulk-loads documents, and runs **two searches** — keyword (BM25) and meaning (dense kNN) — then fuses their rankings with **Reciprocal Rank Fusion** done in Python (`_rrf_fuse`).
 
-| Intent | Example | What it needs |
-|--------|---------|---------------|
-| `causal` | "What caused the cert outage?" | The temporal and contextual chain leading to the incident |
-| `resolution` | "How was the ODLM issue fixed?" | The action taken and what decision it came from |
-| `timeline` | "What changed in the week before the November incident?" | Chronological ordering of related events |
-| `similar` | "Has this kind of pod restart happened before?" | Corroborating cases and domain-shared incidents |
-
-### Step 2 — Map Intent to Edge Type Priorities
-
-Each intent maps deterministically to an ordered list of edge types. The ordering comes from what the edge types mean:
-
-| Intent | Priority order |
-|--------|---------------|
-| `causal` | `PRECEDED_BY` → `PROVIDES_CONTEXT_FOR` → `SUPPORTS` |
-| `resolution` | `IMPLEMENTS` → `REFERENCES` → `PROVIDES_CONTEXT_FOR` |
-| `timeline` | `PRECEDED_BY` → `REFERENCES` |
-| `similar` | `SUPPORTS` → `SHARES_DOMAIN_WITH` → `EXTENDS` |
-
-This is deterministic — not a learned or probabilistic ranking. Edge types not in the priority list for the current intent are not followed at all.
-
-### Step 3 — Find the Seed Document
-
-TF-IDF over the topics and entities stored on every Document node in Neo4j. The document with the highest cosine similarity to the query becomes the starting point for traversal.
-
-### Step 4 — Best-First Traversal
-
-A priority heap spans all visited nodes. At each step, the globally best available edge is popped — ranked first by its position in the intent's priority list, then by strength as a tiebreaker. This means a strong `PRECEDED_BY` edge discovered two hops in will be followed before a weak `SUPPORTS` edge available from the current node.
-
-Traversal stops when either the maximum document count (5) or maximum hop depth (4) is reached, or when no qualifying edges remain.
-
-### Step 5 — Edge Description as Framing
-
-When a neighbor document is retrieved via a traversal hop, its raw text is not injected into the LLM context alone. The edge description is prepended:
-
-```
-[Why this document is here: Document 2 is the cert update CR executed one day
-before the voice outage in Document 1 — it contains the specific implementation
-steps and approval chain for the change that caused the incident.]
-
-[Full document text follows...]
-```
-
-The LLM knows why it is reading this document and what role it plays in the answer before it reads a single word of content.
-
-### Step 6 — Answer Generation
-
-The ordered, framed documents are passed to the LLM with the original query and an instruction to answer specifically using only what is in the provided documents. The answer references actual document names, dates, and technical details — not generic summaries.
+**Why it's built this way:** keyword and meaning search fail in opposite situations, so combining them is more robust than either (full reasoning in [traversal.md §7](traversal.md)). Doing RRF ourselves in Python — rather than via an Elasticsearch feature — means it works on any ES version regardless of license tier. Documents are keyed by their Neo4j hash, so a search result maps straight back to a graph node.
 
 ---
 
-## Running the System
+## 6. The build pipeline (constructs the graph)
 
-### Build the graph
+### `main.py` — the orchestrator
+Runs the five phases in order. Each phase saves its output to `staging/` as JSON; on a later run, earlier phases load from staging instead of recomputing. `--from-phase N` resumes from phase N.
+
+**Why it's built this way:** the phases are expensive (lots of LLM calls). Staging + resume means an interruption — or a deliberate "just re-run Phase 5 with new thresholds" — never forces you to redo the costly earlier work.
+
+### `phase1_extraction.py` — read each document alone
+Reads every `.md` under `docs/CR/` and `docs/RCA/` (skipping templates/READMEs), gives each a **SHA-256 content hash** (so identical files are processed once), and asks the LLM to extract a structured fingerprint — `entities`, `topics`, `stance`, `date` — from **each document in isolation**.
+
+**Why in isolation:** if documents were processed together, the first ones would anchor the vocabulary and bias how every later entity gets named. Processing each alone, then normalizing globally in Phase 2, prevents that first-mover bias.
+
+### `phase2_normalization.py` — unify entity names
+Pools every entity string from every document and asks the LLM, in **small batches**, to map aliases to one canonical form (`"IBM EM"`, `"EM Team"` → `"IBM EM Team (Organization)"`). It then builds a **canonical index** (each entity → which documents mention it + a count), which Phases 3 and 5 both use.
+
+**Why global:** aliases can only be recognized as the same thing if they're seen *together* — per-document normalization would never connect "IBM EM" in one file to "EM Team" in another. **Why small batches (30):** gpt-oss is a reasoning model that spends tokens thinking before writing the mapping; a large batch overflows the output limit and comes back empty. Small batches keep each response safely under the ceiling.
+
+### `phase3_candidate_filtering.py` — narrow down the pairs to score
+With ~300 documents there are ~43,000 possible pairs — far too many to send to the LLM. This phase keeps only **plausible** pairs, using two gates: a pair passes if it shares at least `MIN_ENTITY_OVERLAP` canonical entities (**primary gate**), or — only checked if the first fails — if its TF-IDF text similarity exceeds `MIN_SEMANTIC_SIMILARITY` (**semantic fallback gate**, which catches same-topic pairs that use different words). Rare entities count more (IDF-like specificity weighting) when sorting candidates. Each candidate records which gate it passed.
+
+**Why it's built this way:** it's the cost-control valve for the whole pipeline — it turns ~43k expensive LLM calls into a manageable candidate set. (We analyzed the gate thresholds with `analyze_phase4.py` and found loosening/tightening them trades real edges for noise, so they're left as-is — see §9.)
+
+### `phase4_relationship_scoring.py` — judge each pair
+For every candidate pair it reads **both full documents** and asks the LLM for: the relationship `type`, a `strength` (1–10), the `directionality`, a `confidence`, and — most importantly — a one-sentence `description` written as *directional framing* ("if you just read document A and follow this edge, here's what's in B and why it matters"). Pairs run through a **thread pool** (`PHASE4_CONCURRENCY` at a time), results are checkpointed every 10, and a re-run **skips already-scored pairs**.
+
+**Why full documents:** an RCA tells a story; chunking it risks separating the cause from the effect, so the LLM needs the whole narrative to judge the relationship. **Why the description matters so much:** it's the exact text the query engine later shows the LLM to explain why a retrieved document is relevant — it captures connections the raw text never states. **Why concurrent:** scoring tens of thousands of pairs one-at-a-time took ~18 hours; running 8 in parallel cuts that to a few hours with identical results (the LLM client's retry/backoff makes parallel calls safe). **Why `NONE`:** a conservative "no real relationship" verdict that Phase 5 drops.
+
+### `phase5_graph_construction.py` — write the final graph
+Takes everything above and builds the Neo4j graph in five steps: (1) **filter** out `NONE`, low-strength (`< MIN_RELATIONSHIP_STRENGTH`), and low-confidence relationships; (2) apply a **degree cap** keeping only each document's top `MAX_DEGREE_PER_NODE` strongest edges; (3) create Document nodes; (4) create the Document→Document edges (respecting each one's directionality); (5) create Entity nodes + `MENTIONS` edges, and `PRECEDED_BY` time edges between dated, already-related pairs.
+
+**Why the degree cap:** without it, a document that mentions common entities would connect to everything and dominate every traversal. Keeping only the strongest few edges per node keeps the graph navigable and the final quality high — which is also *why loosening Phase 3 doesn't hurt graph quality*: weak edges that slip through get discarded here anyway. **Why `PRECEDED_BY` only between already-related pairs:** we want "this change preceded this incident," not "every old document preceded every new one."
+
+---
+
+## 7. The query side (answers questions)
+
+### `index_es.py` — build the search index
+After the graph exists, this pulls every Document node **from Neo4j**, reads its full text from disk, computes a dense embedding (if hybrid search is on), and bulk-loads it all into Elasticsearch.
+
+**Why pull from Neo4j (not the files directly):** it guarantees the Elasticsearch document IDs are the same hashes as the graph nodes, so a search hit maps directly to a node to start traversal from. Run it after the pipeline, and re-run it whenever the corpus changes.
+
+### `ask.py` — the traversal engine
+The thing you actually run to ask a question. In short: classify the question's intent (1 LLM call) → turn that into an ordered edge plan → get the top seed documents from Elasticsearch hybrid search (with a TF-IDF fallback if ES is down) → walk the graph best-first, collecting documents → attach each edge's "why it's here" description → write a grounded answer (1 LLM call). Only **two LLM calls** per question; the walk itself is pure graph math.
+
+This is the heart of the system and has its own complete, ground-up explanation in **[traversal.md](traversal.md)** — the seed selection, the best-first heap, the both-directions edge lookup, the framing, and how to defend every design choice.
+
+---
+
+## 8. Tooling
+
+### `analyze_phase4.py` — tune thresholds from evidence
+Reads the Phase 4 results and reports the valid-vs-`NONE` split, the relationship-type mix, strength distribution, and the Phase 3 gate signals — plus a **what-if grid** showing, for various tightened thresholds, how much noise you'd remove versus how many real (and *strong*) edges you'd lose.
+
+**Why it exists:** so Phase 3 thresholds are set from real data, not guesses. Running it is exactly what told us the gates are best left alone (tightening them dropped more strong edges than noise).
+
+---
+
+## 9. How it all runs
 
 ```bash
 cd graph-pipeline
-pip install neo4j scikit-learn requests
-python3 main.py
-```
+source venv/bin/activate
 
-Resume from a specific phase (e.g. after Phase 4 was interrupted):
-```bash
-python3 main.py --from-phase 4
-```
+# one-time setup: which LLM, and its credentials
+export LLM_PROVIDER=watsonx                       # or 'lmstudio' for local Granite
+export WATSONX_API_KEY=...  WATSONX_PROJECT_ID=...
 
-Re-run only graph construction after tuning thresholds:
-```bash
-python3 main.py --from-phase 5
-```
-
-### Query the graph
-
-```bash
-# Single question
+# 1. Build the graph (rarely)
+python3 main.py                 # or --from-phase N to resume
+# 2. Build the search index (after the graph exists / when docs change)
+python3 index_es.py --recreate
+# 3. Ask questions (constantly)
 python3 ask.py "What caused the CPD certificate outage?"
-
-# Interactive mode
-python3 ask.py
 ```
+
+The `LLM_PROVIDER` switch is the payoff of the unified client: you can build the graph on local Granite (free) and answer queries on gpt-oss (better writing), or run everything on one backend — without changing any code.
 
 ---
 
-## Prerequisites
+## 10. Tunable parameters
 
-### Neo4j
-Download Neo4j Desktop, create a local database, and start it. Set your credentials in `graph-pipeline/config.py`:
-```python
-NEO4J_URI      = "bolt://localhost:7687"
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "your-actual-password"
-```
-
-### LM Studio
-Load a model (we use Granite 4.1 8B, identifier `ibm/granite-4.1-8b`) and start the local server on port 1234. Set the model identifier in `graph-pipeline/config.py`:
-```python
-LM_STUDIO_MODEL = "ibm/granite-4.1-8b"
-```
-
----
-
-## Tunable Parameters
-
-All thresholds live in `graph-pipeline/config.py`:
-
-| Parameter | Default | What it controls |
-|-----------|---------|-----------------|
-| `MIN_ENTITY_OVERLAP` | `2` | Min shared entities for Phase 3 primary gate |
-| `MIN_SEMANTIC_SIMILARITY` | `0.25` | Min TF-IDF cosine similarity for Phase 3 fallback gate |
-| `MIN_RELATIONSHIP_STRENGTH` | `4` | Min LLM strength score (1–10) for Phase 5 to write an edge |
-| `MAX_DEGREE_PER_NODE` | `10` | Max edges per document node |
-
-Traversal parameters live in `graph-pipeline/ask.py`:
-
-| Parameter | Default | What it controls |
-|-----------|---------|-----------------|
-| `MAX_DOCS` | `5` | Maximum documents collected per query |
-| `MAX_HOPS` | `4` | Maximum traversal depth from the seed |
+| Parameter | File | Default | Controls |
+|---|---|---|---|
+| `LLM_PROVIDER` | config.py | `watsonx` | Which LLM backend the whole system uses. |
+| `PHASE4_CONCURRENCY` | config.py | 8 | How many pairs Phase 4 scores in parallel. |
+| `MIN_ENTITY_OVERLAP` | config.py | 2 | Phase 3 primary gate: shared entities needed. |
+| `MIN_SEMANTIC_SIMILARITY` | config.py | 0.25 | Phase 3 fallback gate: TF-IDF similarity needed. |
+| `MIN_RELATIONSHIP_STRENGTH` | config.py | 4 | Phase 5 drops edges weaker than this. |
+| `MAX_DEGREE_PER_NODE` | config.py | 10 | Max edges kept per document (anti-hub). |
+| `EMBEDDING_DIM` | config.py | 768 | Must match the embedding model (sets the ES mapping). |
+| `ES_USE_DENSE` | config.py | true | Hybrid (BM25 + meaning) vs keyword-only seeds. |
+| `NUM_SEEDS` | config.py | 3 | How many starting documents a query uses. |
+| `MAX_DOCS` / `MAX_HOPS` | ask.py | 6 / 4 | How many documents a query collects / how far it walks. |
 
 ---
 
-*Built for UPS Watson Incident Intelligence — June 2026*
+## 11. Design philosophy
+
+1. **Two halves, cleanly split.** A slow build pipeline that *understands* the documents and turns them into a graph; a fast query engine that *navigates* that graph. Each is simple on its own.
+2. **The structure is the value.** Most incident questions are answered by the relationships *between* documents, so we make those relationships first-class — scored, described, and used as the retrieval mechanism, not metadata.
+3. **One judgment-heavy step, isolated.** The LLM does the hard reading and judging at build time (extraction, normalization, relationship scoring); at query time the heavy lifting is fast deterministic graph traversal plus just two LLM calls.
+4. **Swappable, resumable, idempotent.** One flag swaps the LLM; staging makes every phase resumable; `MERGE` makes every write safe to repeat. The system is built to be re-run.
+
+---
+
+*Built for UPS Watson Incident Intelligence.*
