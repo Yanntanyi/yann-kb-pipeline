@@ -24,7 +24,7 @@ app = Flask(__name__)
 querier = KnowledgeGraphQuerier()
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
