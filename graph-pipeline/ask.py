@@ -57,9 +57,13 @@ INTENT_DESCRIPTIONS = {
 VALID_INTENTS = set(EDGE_PRIORITIES) | {"thematic"}
 
 # ── Thematic (corpus-wide) parameters ─────────────────────────────────────────
+# Speed note: thematic answers aggregate over each document's *distilled* graph
+# fingerprint (topics + entities + date), NOT its full text. That keeps the synthesis
+# input tiny (~tens of tokens per doc) so we can read the whole corpus cheaply — the
+# graph already did the expensive reading at build time.
 THEMATIC_TOP_N = 12        # entities returned by an entity_count aggregation
-THEMATIC_MAX_DOCS = 40     # documents gathered for a theme_synthesis (no walk cap)
-THEMATIC_DOC_CHARS = 6000  # per-document char cap when building synthesis context
+THEMATIC_MAX_DOCS = 50     # documents summarised for a theme_synthesis (no walk cap)
+THEMATIC_ANSWER_TOKENS = 1536  # answer budget — output is a list/count, not an essay
 
 # Strong corpus-wide markers. These only PROMOTE an otherwise single-incident
 # classification to 'thematic' (never the reverse), as a backstop for the case the
@@ -85,44 +89,82 @@ class KnowledgeGraphQuerier:
         self.neo4j = Neo4jHandler()
         self.llm = get_llm_client()
         self.es = ElasticsearchHandler() if config.ES_ENABLED else None
+        self._entity_types_cache = None  # filled lazily, reused across queries
 
     # ── Step 1: Intent classification ────────────────────────────────────────
 
-    def classify_intent(self, query: str) -> str:
-        """Classify the query into one of five intents via one LLM call.
+    def classify(self, query: str) -> Dict[str, Any]:
+        """One LLM call: pick the intent AND, if thematic, plan how to answer it.
 
-        Four are single-incident-scoped (causal/resolution/timeline/similar); the
-        fifth, 'thematic', is corpus-wide. A keyword backstop only ever promotes a
-        single-incident verdict to thematic, never the reverse — so an aggregation
-        question the LLM mislabels as 'causal' still gets routed correctly.
+        Folding the thematic plan into the classification call means a corpus-wide
+        question costs the same TWO LLM calls as a traversal query (classify+plan,
+        then answer) instead of three. The plan fields are ignored for the four
+        single-incident intents.
+
+        Returns {"intent": str, "thematic_plan": {...} | None}. A keyword backstop
+        only ever promotes a single-incident verdict to thematic, never the reverse.
         """
-        prompt = f"""Classify this incident management query into exactly one category.
+        types = self._available_entity_types()
+        types_str = ", ".join(types) if types else "(none)"
+        prompt = f"""Classify this incident-management query, and if it is corpus-wide, plan how to answer it.
 
-Categories:
-- causal: what caused a SPECIFIC incident, failure, or outage — root cause of one event
-- resolution: how a SPECIFIC issue was fixed, what steps resolved it, the solution
-- timeline: the sequence of events for a SPECIFIC incident — what changed when
-- similar: whether a SPECIFIC incident happened before / find related past cases
-- thematic: a question ABOUT THE WHOLE CORPUS rather than one incident — counting,
-  ranking, trends, or patterns across many incidents. Examples: "how often was X a
-  contributing factor", "which teams appear most", "what is the most common root
-  cause", "which incidents were certificate-related", "what recurring patterns exist".
+Single-incident intents (about ONE incident):
+- causal: what caused a specific incident
+- resolution: how a specific issue was fixed
+- timeline: the sequence of events for a specific incident
+- similar: whether a specific incident happened before / related past cases
+
+Corpus-wide intent (about MANY incidents at once):
+- thematic: counting, ranking, trends, or patterns across the whole corpus —
+  "how often was X a factor", "which teams appear most", "most common root cause",
+  "which incidents were certificate-related", "what recurring patterns exist".
+
+If AND ONLY IF intent is "thematic", also fill a plan:
+- mode "entity_count": a count/ranking of a stored entity kind. Set entity_type to the
+  best match from these types: {types_str} (or null to count all entities).
+- mode "theme_synthesis": needs reading across documents (patterns, contributing
+  factors, which incidents match a theme). Set theme to a short lowercase keyword
+  (e.g. "certificate", "communication") or null to consider all incidents.
 
 Query: "{query}"
 
-Return ONLY valid JSON: {{"intent": "causal" | "resolution" | "timeline" | "similar" | "thematic"}}"""
+Return ONLY valid JSON:
+{{"intent": "causal|resolution|timeline|similar|thematic", "mode": "entity_count|theme_synthesis|null", "entity_type": "<type or null>", "theme": "<keyword or null>"}}"""
 
         try:
             result = self.llm.generate_json(prompt)
-            intent = result.get("intent", "").lower().strip()
+            intent = str(result.get("intent", "")).lower().strip()
             if intent not in VALID_INTENTS:
                 intent = "similar"
         except Exception:
-            intent = "similar"
+            result, intent = {}, "similar"
 
         if intent != "thematic" and _looks_thematic(query):
             intent = "thematic"
-        return intent
+
+        plan = self._normalize_plan(result) if intent == "thematic" else None
+        return {"intent": intent, "thematic_plan": plan}
+
+    def classify_intent(self, query: str) -> str:
+        """Back-compat wrapper: return just the intent string."""
+        return self.classify(query)["intent"]
+
+    @staticmethod
+    def _normalize_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean a raw thematic plan (mode/entity_type/theme), coercing 'null' strings."""
+        def _clean(v):
+            if isinstance(v, str) and v.strip().lower() in ("null", "none", ""):
+                return None
+            return v
+
+        mode = raw.get("mode")
+        if mode not in ("entity_count", "theme_synthesis"):
+            mode = "theme_synthesis"
+        return {
+            "mode": mode,
+            "entity_type": _clean(raw.get("entity_type")),
+            "theme": _clean(raw.get("theme")),
+        }
 
     # ── Step 2: Seed document selection ──────────────────────────────────────
 
@@ -353,10 +395,12 @@ Documents (in traversal order — each is labeled with why it was retrieved):
 {context}
 
 Instructions:
-- Answer specifically and directly using the information in the documents
-- Reference specific document names, dates, components, and technical details
-- If the documents don't contain enough information to fully answer, say so explicitly
-- Do not introduce information that is not in the provided documents
+- Lead with the direct answer in the first sentence. No preamble, no restating the question.
+- Be concise — include only what answers the question. Prefer a short paragraph or a few tight bullet points; do NOT pad with background the user didn't ask for.
+- Cite specific document names, dates, and components where they matter.
+- You may use light Markdown (**bold** for key terms, "- " bullets); it will be rendered.
+- If the documents don't fully answer the question, say so briefly. Do not introduce outside information.
+- Output only the final answer, not your reasoning.
 
 Answer:"""
 
@@ -372,25 +416,31 @@ Answer:"""
     # LLM tally/pattern over ALL of it (theme_synthesis).
 
     def _available_entity_types(self) -> List[str]:
-        """Distinct entity_type labels present in the graph (for count scoping)."""
+        """Distinct entity_type labels present in the graph (cached per session).
+
+        The classify call needs these to map "teams" → the real label, so it runs
+        on (almost) every query; the types don't change between queries, so we fetch
+        them once and reuse — one cheap Cypher round-trip, not one per question.
+        """
+        if getattr(self, "_entity_types_cache", None) is not None:
+            return self._entity_types_cache
         try:
             rows = self.neo4j.query_graph(
                 "MATCH (e:Entity) WHERE e.entity_type IS NOT NULL "
                 "RETURN DISTINCT e.entity_type AS t ORDER BY t"
             )
-            return [r["t"] for r in rows if r.get("t")]
+            self._entity_types_cache = [r["t"] for r in rows if r.get("t")]
         except Exception:
-            return []
+            self._entity_types_cache = []
+        return self._entity_types_cache
 
     def plan_thematic(self, query: str) -> Dict[str, Any]:
-        """Decide HOW to answer a corpus-wide question (one LLM call).
+        """Fallback planner (one LLM call) for when the keyword backstop promoted a
+        question to thematic but the combined classify() call produced no plan.
 
-        Returns {mode, entity_type, theme}:
-          - 'entity_count'    → exact Cypher GROUP BY/COUNT over MENTIONS edges,
-            optionally scoped to one entity_type (e.g. "which teams appear most").
-          - 'theme_synthesis' → gather every document matching a theme (or all
-            incidents) and let the LLM aggregate over the whole set, for things that
-            are not stored entities (e.g. contributing factors, root-cause families).
+        Normally the plan rides along with classify() for free; this only fires on
+        the rare promote-after-misclassification path. Returns {mode, entity_type,
+        theme} — see _normalize_plan / run_thematic for what each does.
         """
         types = self._available_entity_types()
         types_str = ", ".join(types) if types else "(none available)"
@@ -401,37 +451,19 @@ Question: "{query}"
 Entity types stored as nodes in the graph: {types_str}
 
 Choose ONE mode:
-- "entity_count": the answer is a COUNT or RANKING of a kind of thing the graph stores
-  as entity nodes (teams, components, services, technologies...). Set entity_type to the
-  best-matching type from the list above, or null to count across all entities.
-- "theme_synthesis": the answer needs reading across many documents to find a pattern,
-  tally something that is NOT a stored entity (e.g. contributing factors, root-cause
-  categories), or list which incidents match a theme. Set theme to a short lowercase
-  keyword to filter documents by (e.g. "certificate", "communication", "pod restart"),
-  or null to consider all incidents.
+- "entity_count": a COUNT or RANKING of a kind of thing stored as entity nodes (teams,
+  components, services...). Set entity_type to the best match above, or null for all.
+- "theme_synthesis": needs reading across documents (patterns, contributing factors,
+  which incidents match a theme). Set theme to a short lowercase keyword, or null.
 
 Return ONLY valid JSON:
 {{"mode": "entity_count" | "theme_synthesis", "entity_type": "<type or null>", "theme": "<keyword or null>"}}"""
 
         try:
-            plan = self.llm.generate_json(prompt)
+            raw = self.llm.generate_json(prompt)
         except Exception:
-            plan = {}
-
-        mode = plan.get("mode")
-        if mode not in ("entity_count", "theme_synthesis"):
-            mode = "theme_synthesis"
-
-        def _clean(v):
-            if isinstance(v, str) and v.strip().lower() in ("null", "none", ""):
-                return None
-            return v
-
-        return {
-            "mode": mode,
-            "entity_type": _clean(plan.get("entity_type")),
-            "theme": _clean(plan.get("theme")),
-        }
+            raw = {}
+        return self._normalize_plan(raw)
 
     def aggregate_entities(
         self, entity_type: Any, top_n: int = THEMATIC_TOP_N
@@ -453,15 +485,21 @@ Return ONLY valid JSON:
 
     def gather_thematic_set(
         self, theme: Any, limit: int = THEMATIC_MAX_DOCS
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """Collect the FULL set of documents for a theme — no best-first cap.
 
-        With a theme: match it against each document's topics, entities, mentioned
-        entity names, and filepath. Without one: fall back to all incident reports
-        (RCA/*), since corpus-wide pattern questions are about incidents.
+        Returns each document's distilled fingerprint (filepath, date, topics,
+        entities) straight from the graph — NOT its full text. That is the whole
+        speed trick: the expensive reading already happened at build time, so we
+        aggregate over compact summaries (~tens of tokens each) instead of dumping
+        dozens of full documents into the model.
+
+        With a theme: match it against topics, entities, mentioned entity names, and
+        filepath. Without one: fall back to all incident reports (RCA/*), since
+        corpus-wide pattern questions are about incidents.
         """
         if theme:
-            rows = self.neo4j.query_graph(
+            return self.neo4j.query_graph(
                 """
                 MATCH (d:Document)
                 OPTIONAL MATCH (d)-[:MENTIONS]->(e:Entity)
@@ -470,38 +508,38 @@ Return ONLY valid JSON:
                    OR any(x IN d.entities WHERE toLower(x) CONTAINS $theme)
                    OR any(n IN enames     WHERE n CONTAINS $theme)
                    OR toLower(d.filepath) CONTAINS $theme
-                RETURN d.filepath AS filepath
-                ORDER BY d.filepath
+                RETURN d.filepath AS filepath, d.date AS date,
+                       d.topics AS topics, d.entities AS entities
+                ORDER BY d.date DESC, d.filepath
                 LIMIT $limit
                 """,
                 theme=theme.lower(),
                 limit=limit,
             )
-        else:
-            rows = self.neo4j.query_graph(
-                """
-                MATCH (d:Document)
-                WHERE toLower(d.filepath) STARTS WITH 'rca/'
-                RETURN d.filepath AS filepath
-                ORDER BY d.filepath
-                LIMIT $limit
-                """,
-                limit=limit,
-            )
-        return [r["filepath"] for r in rows]
+        return self.neo4j.query_graph(
+            """
+            MATCH (d:Document)
+            WHERE toLower(d.filepath) STARTS WITH 'rca/'
+            RETURN d.filepath AS filepath, d.date AS date,
+                   d.topics AS topics, d.entities AS entities
+            ORDER BY d.date DESC, d.filepath
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
 
-    def _build_thematic_context(self, filepaths: List[str]) -> str:
-        """Concatenate the gathered documents (each truncated) for synthesis."""
+    def _build_thematic_context(self, rows: List[Dict[str, Any]]) -> str:
+        """Build a compact digest (one short block per doc) from graph fingerprints."""
         sections = []
-        for i, fp in enumerate(filepaths):
-            try:
-                text = (config.DOCUMENTS_DIR / fp).read_text(encoding="utf-8")
-            except Exception:
-                continue
-            if len(text) > THEMATIC_DOC_CHARS:
-                text = text[:THEMATIC_DOC_CHARS] + "\n…[truncated]"
-            sections.append(f"[Document {i + 1}: {fp}]\n\n{text}")
-        return ("\n\n" + "─" * 60 + "\n\n").join(sections)
+        for i, r in enumerate(rows, 1):
+            topics = ", ".join(r.get("topics") or []) or "—"
+            entities = ", ".join(r.get("entities") or []) or "—"
+            date = r.get("date") or "n/a"
+            sections.append(
+                f"[Doc {i}: {r['filepath']} | date: {date}]\n"
+                f"  topics: {topics}\n  entities: {entities}"
+            )
+        return "\n\n".join(sections)
 
     def answer_entity_count(
         self, query: str, entity_type: Any, counts: List[Dict[str, Any]]
@@ -519,37 +557,46 @@ Question: {query}
 Exact document-mention counts{scope}, highest first:
 {table}
 
-Write a clear, direct answer grounded in these exact numbers, naming the top entities and their counts. Do not invent or recompute any numbers beyond those given."""
+Write a brief, direct answer (1-3 sentences or a short ranked list) grounded in these exact numbers, naming the top entities and their counts. Lead with the answer; no preamble. You may use light Markdown (**bold**, "- " bullets). Do not invent or recompute any numbers beyond those given. Output only the answer, not your reasoning."""
         return self.llm.generate_text(prompt, max_tokens=1024)
 
     def answer_theme_synthesis(
         self, query: str, theme: Any, context: str, filepaths: List[str]
     ) -> str:
-        """Aggregate/pattern over the FULL gathered set in one LLM call."""
+        """Aggregate/pattern over the FULL gathered set of summaries in one LLM call."""
         if not context.strip():
             suffix = f" for the theme '{theme}'." if theme else "."
             return (
                 "No documents in the knowledge graph matched this question" + suffix
             )
         scope = f"documents related to '{theme}'" if theme else "all incident reports"
-        prompt = f"""You are answering a corpus-wide question by reading across {scope}. You have the COMPLETE set of matching documents ({len(filepaths)} total), so you can count and find patterns across all of them.
+        prompt = f"""You are answering a corpus-wide question by aggregating across {scope}. Below is the COMPLETE set of matching documents ({len(filepaths)} total), each given as a compact summary (its topics and named entities). Count and find patterns across all of them.
 
 Question: {query}
 
-Documents:
+Document summaries:
 {context}
 
 Instructions:
-- Aggregate across ALL the documents above — count occurrences, rank, or describe the recurring pattern as the question asks.
-- Be specific: cite document names and give counts (e.g. "X of {len(filepaths)} documents…") where relevant.
-- Base every claim only on the documents provided. If they don't support a confident answer, say so.
+- Lead with the direct answer; no preamble or restating the question. Keep it concise — a short summary or tight ranked list, not an essay.
+- Aggregate across ALL the summaries — count, rank, or describe the recurring pattern as asked. Give counts (e.g. "X of {len(filepaths)} documents…") and cite document names where relevant.
+- You may use light Markdown (**bold**, "- " bullets); it will be rendered.
+- Base claims only on the summaries. If a detail isn't captured (e.g. a contributing factor not listed as a topic), say it isn't determinable from the summary view rather than guessing.
+- Output only the final answer, not your reasoning.
 
 Answer:"""
-        return self.llm.generate_text(prompt, max_tokens=4096)
+        return self.llm.generate_text(prompt, max_tokens=THEMATIC_ANSWER_TOKENS)
 
-    def run_thematic(self, query: str) -> Dict[str, Any]:
-        """Answer a corpus-wide question via aggregation, not traversal."""
-        plan = self.plan_thematic(query)
+    def run_thematic(
+        self, query: str, plan: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """Answer a corpus-wide question via aggregation, not traversal.
+
+        `plan` normally arrives free from classify(); if absent (the keyword-promotion
+        path), we fall back to a dedicated plan_thematic() call.
+        """
+        if plan is None:
+            plan = self.plan_thematic(query)
 
         if plan["mode"] == "entity_count":
             counts = self.aggregate_entities(plan["entity_type"])
@@ -581,8 +628,9 @@ Answer:"""
             plan = {"mode": "theme_synthesis", "entity_type": None,
                     "theme": plan.get("entity_type")}
 
-        filepaths = self.gather_thematic_set(plan.get("theme"))
-        context = self._build_thematic_context(filepaths)
+        rows = self.gather_thematic_set(plan.get("theme"))
+        filepaths = [r["filepath"] for r in rows]
+        context = self._build_thematic_context(rows)
         answer = self.answer_theme_synthesis(query, plan.get("theme"), context, filepaths)
         label = (f"matched theme '{plan['theme']}'" if plan.get("theme")
                  else "incident document (corpus-wide analysis)")
@@ -614,9 +662,11 @@ Answer:"""
         Thematic (corpus-wide) questions branch to run_thematic(), which answers by
         aggregation/full-set synthesis instead of best-first traversal.
         """
-        intent = self.classify_intent(query)
+        routed = self.classify(query)
+        intent = routed["intent"]
         if intent == "thematic":
-            return self.run_thematic(query)
+            # The plan rides along with classify() for free — no second LLM call.
+            return self.run_thematic(query, routed.get("thematic_plan"))
 
         seeds = self.find_seeds(query)
         path = self.traverse(seeds, intent)
