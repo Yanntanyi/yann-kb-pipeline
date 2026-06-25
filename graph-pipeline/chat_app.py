@@ -78,6 +78,9 @@ PAGE = """<!doctype html>
   .path-file { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
   .path-seed { color: var(--seed); }
   .path-why { color: var(--muted); font-size: 12px; margin-top: 3px; font-style: italic; }
+  .bubble code { background: rgba(127,127,127,.15); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .bubble ul, .bubble ol { margin: 6px 0 6px 20px; padding: 0; }
+  .bubble li { margin: 2px 0; }
   footer {
     border-top: 1px solid var(--border); background: var(--panel);
     padding: 14px 20px;
@@ -120,6 +123,35 @@ PAGE = """<!doctype html>
     const d = document.createElement("div");
     d.textContent = s == null ? "" : String(s);
     return d.innerHTML;
+  }
+
+  // Render a small, safe subset of Markdown. Input MUST already be HTML-escaped;
+  // we only re-introduce the specific tags we generate here, so model output can't
+  // inject HTML. Handles **bold**, `code`, #-headers, and -/* and 1. lists.
+  function mdToHtml(escaped) {
+    const inline = (t) => t
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>");
+    let html = "", list = null;
+    const closeList = () => { if (list) { html += "</" + list + ">"; list = null; } };
+    for (const raw of escaped.split(/\r?\n/)) {
+      const line = raw.trim();
+      let m;
+      if (!line) { closeList(); continue; }
+      if (m = line.match(/^#{1,6}\s+(.*)$/)) {
+        closeList(); html += "<strong>" + inline(m[1]) + "</strong><br>";
+      } else if (m = line.match(/^[-*]\s+(.*)$/)) {
+        if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; }
+        html += "<li>" + inline(m[1]) + "</li>";
+      } else if (m = line.match(/^\d+\.\s+(.*)$/)) {
+        if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; }
+        html += "<li>" + inline(m[1]) + "</li>";
+      } else {
+        closeList(); html += inline(line) + "<br>";
+      }
+    }
+    closeList();
+    return html;
   }
 
   function addMessage(role, html) {
@@ -178,7 +210,7 @@ PAGE = """<!doctype html>
         pending.className = "msg error";
         pending.querySelector(".bubble").innerHTML = esc(data.error || ("HTTP " + res.status));
       } else {
-        pending.querySelector(".bubble").innerHTML = esc(data.answer) + renderTrace(data);
+        pending.querySelector(".bubble").innerHTML = mdToHtml(esc(data.answer)) + renderTrace(data);
       }
     } catch (e) {
       pending.className = "msg error";
