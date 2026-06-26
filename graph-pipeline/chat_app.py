@@ -189,6 +189,13 @@ PAGE = r"""<!doctype html>
       }
       h += '</div>';
     });
+    if (d.timing) {
+      h += '<div class="trace-section">Timing</div>';
+      var tm = d.timing, parts = [];
+      Object.keys(tm).forEach(function (k) { if (k !== 'total') parts.push(k + ' ' + tm[k] + 's'); });
+      h += '<div class="path-file"><strong>total ' + (tm.total != null ? tm.total : '?') + 's</strong>'
+         + (parts.length ? '  ·  ' + parts.join('  ·  ') : '') + '</div>';
+    }
     h += '</details>';
     return h;
   }
