@@ -15,6 +15,8 @@ Usage:
 
 import heapq
 import sys
+import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Set
 
 import numpy as np
@@ -25,6 +27,25 @@ from neo4j_handler import Neo4jHandler
 from es_handler import ElasticsearchHandler
 from llm_client import get_llm_client
 import config
+
+
+@contextmanager
+def _timed(store: Dict[str, float], label: str):
+    """Record wall-clock seconds for the wrapped block into store[label]."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        store[label] = time.perf_counter() - start
+
+
+def _format_timing(timing: Dict[str, float]) -> str:
+    """One-line 'total Xs · stage Ys · …' summary for the CLI/trace."""
+    if not timing:
+        return ""
+    parts = [f"{k} {v}s" for k, v in timing.items() if k != "total"]
+    head = f"total {timing.get('total', '?')}s"
+    return head + ("  ·  " + "  ·  ".join(parts) if parts else "")
 
 # ── Traversal parameters ──────────────────────────────────────────────────────
 
@@ -603,13 +624,17 @@ Answer:"""
         `plan` normally arrives free from classify(); if absent (the keyword-promotion
         path), we fall back to a dedicated plan_thematic() call.
         """
+        timing: Dict[str, float] = {}
         if plan is None:
-            plan = self.plan_thematic(query)
+            with _timed(timing, "plan"):
+                plan = self.plan_thematic(query)
 
         if plan["mode"] == "entity_count":
-            counts = self.aggregate_entities(plan["entity_type"])
+            with _timed(timing, "aggregate"):
+                counts = self.aggregate_entities(plan["entity_type"])
             if counts:
-                answer = self.answer_entity_count(query, plan["entity_type"], counts)
+                with _timed(timing, "answer"):
+                    answer = self.answer_entity_count(query, plan["entity_type"], counts)
                 seen: Set[str] = set()
                 path: List[Dict[str, Any]] = []
                 for row in counts:
@@ -631,15 +656,18 @@ Answer:"""
                     "aggregation": counts,
                     "path": path,
                     "answer": answer,
+                    "timing": {k: round(v, 3) for k, v in timing.items()},
                 }
             # No entities of that type — fall back to reading by theme.
             plan = {"mode": "theme_synthesis", "entity_type": None,
                     "theme": plan.get("entity_type")}
 
-        rows = self.gather_thematic_set(plan.get("theme"))
+        with _timed(timing, "gather"):
+            rows = self.gather_thematic_set(plan.get("theme"))
         filepaths = [r["filepath"] for r in rows]
         context = self._build_thematic_context(rows)
-        answer = self.answer_theme_synthesis(query, plan.get("theme"), context, filepaths)
+        with _timed(timing, "answer"):
+            answer = self.answer_theme_synthesis(query, plan.get("theme"), context, filepaths)
         label = (f"matched theme '{plan['theme']}'" if plan.get("theme")
                  else "incident document (corpus-wide analysis)")
         path = [
@@ -656,6 +684,7 @@ Answer:"""
             "aggregation": None,
             "path": path,
             "answer": answer,
+            "timing": {k: round(v, 3) for k, v in timing.items()},
         }
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -670,16 +699,29 @@ Answer:"""
         Thematic (corpus-wide) questions branch to run_thematic(), which answers by
         aggregation/full-set synthesis instead of best-first traversal.
         """
-        routed = self.classify(query)
+        timing: Dict[str, float] = {}
+        t_start = time.perf_counter()
+
+        with _timed(timing, "classify"):
+            routed = self.classify(query)
         intent = routed["intent"]
+
         if intent == "thematic":
             # The plan rides along with classify() for free — no second LLM call.
-            return self.run_thematic(query, routed.get("thematic_plan"))
+            result = self.run_thematic(query, routed.get("thematic_plan"))
+            result.setdefault("timing", {})["classify"] = round(timing["classify"], 3)
+            result["timing"]["total"] = round(time.perf_counter() - t_start, 3)
+            return result
 
-        seeds = self.find_seeds(query)
-        path = self.traverse(seeds, intent)
-        context = self.build_context(path)
-        answer = self.generate_answer(query, intent, context)
+        with _timed(timing, "seeds"):
+            seeds = self.find_seeds(query)
+        with _timed(timing, "traverse"):
+            path = self.traverse(seeds, intent)
+        with _timed(timing, "context"):
+            context = self.build_context(path)
+        with _timed(timing, "answer"):
+            answer = self.generate_answer(query, intent, context)
+        timing["total"] = time.perf_counter() - t_start
 
         return {
             "query": query,
@@ -697,12 +739,17 @@ Answer:"""
                 for node in path
             ],
             "answer": answer,
+            "timing": {k: round(v, 3) for k, v in timing.items()},
         }
 
     def ask(self, query: str) -> str:
         """Run a query and print a human-readable trace (CLI entry point)."""
         print(f"\nQuery: {query}")
         result = self.run_query(query)
+
+        timing_line = _format_timing(result.get("timing", {}))
+        if timing_line:
+            print(f"Timing: {timing_line}")
 
         if result["intent"] == "thematic":
             plan = result.get("thematic_plan", {})
