@@ -28,8 +28,13 @@ import config
 
 # ── Traversal parameters ──────────────────────────────────────────────────────
 
-MAX_DOCS = 6   # maximum documents to collect (config.NUM_SEEDS anchors + graph hops)
-MAX_HOPS = 4   # maximum graph edges followed beyond the seeds
+MAX_DOCS = 10  # maximum documents to collect (config.NUM_SEEDS anchors + graph hops)
+MAX_HOPS = 7   # maximum graph edges followed beyond the seeds
+# Balance note: keep NUM_SEEDS (config.py) well below MAX_DOCS so the walk has room
+# to traverse. With NUM_SEEDS=3 and these values the walk can take up to 7 hops; if
+# NUM_SEEDS is near MAX_DOCS (e.g. 5/6) the seeds eat the budget and traversal barely
+# happens. Raising MAX_DOCS adds reach but more context/tokens — dial back to ~8 if
+# answers lose focus.
 
 # Ordered edge type priorities per query intent.
 # Index in the list = priority rank (lower index = follow first).
@@ -308,6 +313,7 @@ Return ONLY valid JSON:
                     "hash": seed["hash"],
                     "filepath": seed["filepath"],
                     "edge_description": None,
+                    "is_seed": True,
                 }
             )
             if len(path) >= MAX_DOCS:
@@ -338,6 +344,8 @@ Return ONLY valid JSON:
                     "hash": neighbor["neighbor_hash"],
                     "filepath": neighbor["filepath"],
                     "edge_description": neighbor["description"],
+                    "rel_type": neighbor["rel_type"],
+                    "is_seed": False,
                 }
             )
             hops += 1
@@ -683,7 +691,8 @@ Answer:"""
                 {
                     "filepath": node["filepath"],
                     "edge_description": node.get("edge_description"),
-                    "is_seed": node.get("edge_description") is None,
+                    "rel_type": node.get("rel_type"),
+                    "is_seed": node.get("is_seed", node.get("edge_description") is None),
                 }
                 for node in path
             ],
