@@ -175,13 +175,16 @@ PAGE = r"""<!doctype html>
       h += '<div class="path-file">🌱 ' + esc(s) + '</div>';
     });
     h += '<div class="trace-section">Traversal path (' + (d.path || []).length + ' docs)</div>';
+    var seedN = 0, hopN = 0;
     (d.path || []).forEach(function (n, i) {
       h += '<div class="path-item">';
       if (n.is_seed) {
-        h += '<div class="path-file path-seed">seed · ' + esc(n.filepath) + '</div>';
+        seedN++;
+        h += '<div class="path-file path-seed">seed ' + seedN + ' · ' + esc(n.filepath) + '</div>';
       } else {
+        hopN++;
         var via = n.rel_type ? ' [' + esc(n.rel_type) + ']' : '';
-        h += '<div class="path-file">hop' + via + ' · ' + esc(n.filepath) + '</div>';
+        h += '<div class="path-file">hop ' + hopN + via + ' · ' + esc(n.filepath) + '</div>';
         if (n.edge_description) h += '<div class="path-why">why: ' + esc(n.edge_description) + '</div>';
       }
       h += '</div>';
