@@ -180,7 +180,8 @@ PAGE = r"""<!doctype html>
       if (n.is_seed) {
         h += '<div class="path-file path-seed">seed · ' + esc(n.filepath) + '</div>';
       } else {
-        h += '<div class="path-file">hop ' + i + ' · ' + esc(n.filepath) + '</div>';
+        var via = n.rel_type ? ' [' + esc(n.rel_type) + ']' : '';
+        h += '<div class="path-file">hop' + via + ' · ' + esc(n.filepath) + '</div>';
         if (n.edge_description) h += '<div class="path-why">why: ' + esc(n.edge_description) + '</div>';
       }
       h += '</div>';
