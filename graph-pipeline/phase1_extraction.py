@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from llm_client import get_llm_client
+from date_utils import resolve_date
 import config
 
 
@@ -60,9 +61,11 @@ Return ONLY the JSON object, no explanations."""
                 if field not in result:
                     raise ValueError(f"Missing required field: {field}")
 
-            # Guard: some models omit optional keys entirely
-            if "date" not in result:
-                result["date"] = None
+            # Deterministic date overlay: filename-authoritative, keep a good LLM
+            # date, else fall back to a body date. The LLM only sees the body and
+            # often misses filename dates / dates-in-passing, so this adds coverage
+            # without overwriting a date the LLM already got right.
+            result["date"] = resolve_date(filepath.name, content, result.get("date"))
 
             return result
 
@@ -72,7 +75,7 @@ Return ONLY the JSON object, no explanations."""
                 "entities": [],
                 "topics": ["unknown"],
                 "stance": "descriptive",
-                "date": None,
+                "date": resolve_date(filepath.name, content, None),
             }
 
     def process_all_documents(self) -> Dict[str, Dict[str, Any]]:
