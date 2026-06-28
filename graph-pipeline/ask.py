@@ -252,26 +252,28 @@ Return ONLY valid JSON:
     # ── Step 3: Graph traversal ───────────────────────────────────────────────
 
     def get_neighbors(
-        self, doc_hash: str, edge_types: List[str], visited: Set[str]
+        self, doc_hash: str, visited: Set[str]
     ) -> List[Dict[str, Any]]:
-        """Return all unvisited Document neighbors reachable via the given edge types.
+        """Return all unvisited Document neighbors reachable via ANY relationship edge.
 
-        Checks both outgoing (current→neighbor) and incoming (neighbor→current)
-        edges. Both directions are relevant — e.g. for a causal query at the RCA
-        node, the PRECEDED_BY edge points inward (CR→RCA), so we need incoming.
-        Deduplicates by neighbor hash, keeping the stronger edge when both
-        directions exist.
+        We fetch every Document→Document relationship edge (both directions),
+        regardless of type. The intent's edge plan is applied later as a PRIORITY
+        ORDER, not a hard filter — so the walk prefers on-plan edges but can still
+        fall back to any relationship edge to reach a connected document. (Diagnostic
+        showed the connecting edges exist but were being excluded as "off-plan".)
+
+        MENTIONS edges point to Entity nodes, so the Document-neighbor match
+        naturally excludes them. Both directions matter — e.g. for a causal query at
+        the RCA node, the PRECEDED_BY edge points inward (CR→RCA). Deduplicates by
+        neighbor hash, keeping the stronger edge when both directions exist.
         """
-        if not edge_types:
-            return []
-
         visited_list = list(visited)
         results: Dict[str, Dict[str, Any]] = {}
 
         outgoing = self.neo4j.query_graph(
             """
             MATCH (d:Document {hash: $hash})-[r]->(neighbor:Document)
-            WHERE type(r) IN $types AND NOT neighbor.hash IN $visited
+            WHERE NOT neighbor.hash IN $visited
             RETURN type(r) AS rel_type,
                    r.description AS description,
                    coalesce(r.strength, 5) AS strength,
@@ -279,14 +281,13 @@ Return ONLY valid JSON:
                    neighbor.filepath AS filepath
             """,
             hash=doc_hash,
-            types=edge_types,
             visited=visited_list,
         )
 
         incoming = self.neo4j.query_graph(
             """
             MATCH (neighbor:Document)-[r]->(d:Document {hash: $hash})
-            WHERE type(r) IN $types AND NOT neighbor.hash IN $visited
+            WHERE NOT neighbor.hash IN $visited
             RETURN type(r) AS rel_type,
                    r.description AS description,
                    coalesce(r.strength, 5) AS strength,
@@ -294,7 +295,6 @@ Return ONLY valid JSON:
                    neighbor.filepath AS filepath
             """,
             hash=doc_hash,
-            types=edge_types,
             visited=visited_list,
         )
 
@@ -315,11 +315,17 @@ Return ONLY valid JSON:
         with edges from every other. Continues until MAX_DOCS documents are
         collected or no qualifying edges remain.
 
+        The intent's edge plan is a PRIORITY ORDER, not a filter: on-plan edge types
+        are followed first (in plan order), but any other relationship edge is still
+        eligible as a fallback (ranked after the plan), so the walk can reach a
+        connected document even when its edge type isn't in the plan.
+
         Returns an ordered list of dicts: {hash, filepath, edge_description}.
         edge_description is None for seeds (they were retrieved, not followed).
         """
         edge_types = EDGE_PRIORITIES.get(intent, [])
         priority_rank = {etype: i for i, etype in enumerate(edge_types)}
+        off_plan_rank = len(edge_types)  # off-plan edges sort after every on-plan type
 
         visited: Set[str] = set()
         path: List[Dict[str, Any]] = []
@@ -347,8 +353,8 @@ Return ONLY valid JSON:
 
         # Seed the frontier with the graph neighbors of every anchor.
         for anchor in path:
-            for neighbor in self.get_neighbors(anchor["hash"], edge_types, visited):
-                rank = priority_rank.get(neighbor["rel_type"], 999)
+            for neighbor in self.get_neighbors(anchor["hash"], visited):
+                rank = priority_rank.get(neighbor["rel_type"], off_plan_rank)
                 heapq.heappush(heap, (rank, -neighbor["strength"], counter, neighbor))
                 counter += 1
 
@@ -372,9 +378,9 @@ Return ONLY valid JSON:
             hops += 1
 
             for next_neighbor in self.get_neighbors(
-                neighbor["neighbor_hash"], edge_types, visited
+                neighbor["neighbor_hash"], visited
             ):
-                next_rank = priority_rank.get(next_neighbor["rel_type"], 999)
+                next_rank = priority_rank.get(next_neighbor["rel_type"], off_plan_rank)
                 heapq.heappush(
                     heap, (next_rank, -next_neighbor["strength"], counter, next_neighbor)
                 )
