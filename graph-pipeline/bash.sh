@@ -55,3 +55,18 @@ Traversal actually traverses now.
 
 Date coverage doubled (we recover dates from filenames + body, not just the LLM), which is what makes the temporal/timeline questions possible.
 Cleaner UX — rendered formatting instead of raw markdown, concise answers instead of walls of text, and a "how I got this" trace showing seeds, hops, edge types, and timing.
+
+
+
+
+Hey Harsha — ran a head-to-head eval of the graph system vs a plain hybrid-RAG baseline, on 29 cross-document relationship questions (e.g. "which change caused incident X") with hand-verified answers. Numbers:
+
+metric	graph	flat RAG
+connecting-doc retrieval	62%	79%
+relationship accuracy	62%	81%
+false-link resistance (doesn't invent links)	90%	90%
+Honest read: the graph reliably captures the relationships (every link we test exists as an edge in the graph), but it's not retrieving them better than plain RAG — it's actually behind right now. Root cause: with only ~290 docs, hybrid search already finds most connecting docs by similarity, and the graph trades away similarity-ranked results for graph-walked ones, which on this corpus are worse. The graph's reach advantage should only show up on a bigger/messier corpus where similarity search degrades.
+
+Ask: could we get more RCA/CR docs? Would let us build a bigger, more trustworthy eval (we're capped at ~29 relationship questions by what the current docs support) and actually test the reach hypothesis at scale. Full results attached.
+
+
