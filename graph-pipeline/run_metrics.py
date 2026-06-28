@@ -20,11 +20,14 @@ Usage (needs Neo4j + Elasticsearch + the LLM up, same as ask.py):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import statistics
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+import config
 
 GOLD = Path(__file__).with_name("eval_gold.jsonl")
 RESULTS = Path(__file__).with_name("metrics_results")
@@ -150,6 +153,14 @@ def main():
         gold = gold[: args.limit]
     print(f"Loaded {len(gold)} gold questions.")
 
+    # Make the LLM backend explicit so you can confirm it before a long run.
+    prov = config.LLM_PROVIDER
+    model = config.WATSONX_MODEL if prov == "watsonx" else config.LM_STUDIO_MODEL
+    embed = config.WATSONX_EMBED_MODEL if prov == "watsonx" else config.LM_STUDIO_EMBED_MODEL
+    print(f"LLM provider: {prov}  |  model: {model}  |  embed: {embed}")
+    if prov != "watsonx":
+        print("  ** NOTE: not using watsonx gpt-oss. Set LLM_PROVIDER=watsonx to use the watsonx API. **")
+
     docs_dir = Path(__file__).resolve().parents[1] / "docs"
     judge = make_judge() if args.judge else None
     RESULTS.mkdir(exist_ok=True)
@@ -170,12 +181,15 @@ def main():
                     continue
                 retrieved = [n["filepath"] for n in res.get("path", [])]
                 row = {
-                    "id": g["id"], "category_intents": g["intents"],
+                    "id": g["id"], "question": g["question"],
+                    "category_intents": g["intents"], "intent_pred": res.get("intent"),
                     "intent_ok": intent_correct(res.get("intent"), g["intents"]),
                     **score_retrieval(retrieved, g["must_have"], g.get("nice_to_have", [])),
                     "latency": res.get("timing", {}).get("total"),
                     "graph_latency": res.get("timing", {}).get("traverse"),
                     "must_abstain": g["must_abstain"],
+                    "n_retrieved": len(retrieved),
+                    "retrieved": retrieved, "must_have": g["must_have"],
                 }
                 if judge is not None:
                     ctx = read_context(docs_dir, retrieved)
@@ -189,10 +203,14 @@ def main():
                 sysobj.close()
         run["systems"][skey] = rows
 
-    out = RESULTS / f"{time.strftime('%Y%m%d-%H%M%S')}.json"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = RESULTS / f"{stamp}.json"
     out.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
     scorecard(run)
-    print(f"\nRaw results -> {out}")
+    detail_csv, summary_csv = write_csv(run, stamp)
+    print(f"\nRaw JSON     -> {out}")
+    print(f"Summary CSV  -> {summary_csv}   (the scorecard, for the meeting)")
+    print(f"Detail CSV   -> {detail_csv}   (per-question, for drill-down)")
 
 
 def scorecard(run: Dict):
@@ -227,6 +245,65 @@ def scorecard(run: Dict):
         print("\nsystem errors:", {k: v for k, v in n_err.items() if v})
     print("\nNote: recall/precision computed only over questions with required docs; "
           "intent accuracy is graph-only (the baseline has no intent).")
+
+
+# ── CSV export ────────────────────────────────────────────────────────────────
+# Aggregate metrics, defined once so the summary CSV and the scorecard agree.
+SUMMARY_METRICS = [
+    ("intent_accuracy_pct",   lambda ok: _pct([r["intent_ok"] for r in ok])),
+    ("must_have_recall_pct",  lambda ok: _pct([r["recall"] for r in ok])),
+    ("all_required_hit_pct",  lambda ok: _pct([r["all_hit"] for r in ok])),
+    ("precision_pct",         lambda ok: _pct([r["precision"] for r in ok])),
+    ("latency_median_s",      lambda ok: _median([r["latency"] for r in ok])),
+    ("latency_p95_s",         lambda ok: _p95([r["latency"] for r in ok])),
+    ("graph_walk_median_s",   lambda ok: _median([r["graph_latency"] for r in ok])),
+    ("faithful_pct",          lambda ok: _pct([r.get("faithful") for r in ok])),
+    ("completeness_pct",      lambda ok: _pct([r.get("completeness") for r in ok])),
+    ("correct_abstention_pct", lambda ok: _pct([r.get("abstained") for r in ok if r.get("must_abstain")])),
+]
+
+DETAIL_COLS = [
+    "system", "id", "question", "expected_intents", "predicted_intent", "intent_ok",
+    "recall", "all_hit", "precision", "latency_s", "graph_walk_s", "must_abstain",
+    "faithful", "completeness", "abstained", "n_retrieved", "retrieved_docs",
+    "must_have_docs", "error",
+]
+
+
+def write_csv(run: Dict, stamp: str):
+    """Write a per-question detail CSV and a one-row-per-metric summary CSV."""
+    detail = RESULTS / f"{stamp}_detail.csv"
+    with detail.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(DETAIL_COLS)
+        for sysname, rows in run["systems"].items():
+            for r in rows:
+                if "error" in r:
+                    w.writerow([sysname, r.get("id", "")] + [""] * 16 + [r["error"]])
+                    continue
+                w.writerow([
+                    sysname, r["id"], r.get("question", ""),
+                    "|".join(r.get("category_intents", [])), r.get("intent_pred", ""),
+                    r.get("intent_ok"), r.get("recall"), r.get("all_hit"), r.get("precision"),
+                    r.get("latency"), r.get("graph_latency"), r.get("must_abstain"),
+                    r.get("faithful"), r.get("completeness"), r.get("abstained"),
+                    r.get("n_retrieved"), "|".join(r.get("retrieved", [])),
+                    "|".join(r.get("must_have", [])), "",
+                ])
+
+    summary = RESULTS / f"{stamp}_summary.csv"
+    systems = list(run["systems"])
+    with summary.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["metric"] + systems)
+        for name, fn in SUMMARY_METRICS:
+            cells = []
+            for s in systems:
+                ok = [r for r in run["systems"][s] if "error" not in r]
+                v = fn(ok)
+                cells.append("" if v is None else v)
+            w.writerow([name] + cells)
+    return detail, summary
 
 
 if __name__ == "__main__":
