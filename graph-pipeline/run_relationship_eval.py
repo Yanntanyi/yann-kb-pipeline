@@ -110,6 +110,8 @@ def main():
                     "connecting_hit": 1 if g["connecting_doc"] in retrieved else 0,
                     "all_connected": 1 if set(g["must_connect"]) <= retrieved else 0,
                     "rel": rel,
+                    "intent": res.get("intent"),
+                    "n_retrieved": len(res.get("path", [])),
                 }
                 answers[g["id"]][skey] = res["answer"]
         finally:
@@ -164,6 +166,23 @@ def scorecard(gold, results, systems):
     agg("Relationship accuracy % (pos)", "rel", positives)
     if negatives:
         agg("False-link resistance % (neg)", "rel", negatives)
+
+    # ROUTING — what intent did the graph send each question to? (thematic SKIPS the walk)
+    if "graph_traversal" in systems:
+        from collections import Counter
+        rows = [results[g["id"]]["graph_traversal"] for g in gold
+                if "graph_traversal" in results[g["id"]]
+                and "error" not in results[g["id"]]["graph_traversal"]]
+        intents = Counter(r.get("intent") for r in rows)
+        print("\n" + "-" * 78)
+        print("GRAPH ROUTING — intent each relationship question was classified as:")
+        for it, c in intents.most_common():
+            tag = "   <-- SKIPS TRAVERSAL (aggregation path; the edge fix doesn't apply)" \
+                  if it == "thematic" else ""
+            print(f"    {str(it):<12} {c:>2}{tag}")
+        ndocs = [r.get("n_retrieved") for r in rows if r.get("n_retrieved") is not None]
+        if ndocs:
+            print(f"    avg docs retrieved by graph: {round(sum(ndocs)/len(ndocs), 1)}")
 
     # the 2x2: split positive questions by whether flat retrieved the connecting doc
     if "flat_rag" in systems and "graph_traversal" in systems:
