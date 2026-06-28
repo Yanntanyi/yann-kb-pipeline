@@ -203,14 +203,14 @@ def main():
                 sysobj.close()
         run["systems"][skey] = rows
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = RESULTS / f"{stamp}.json"
+    stamp = time.strftime("%Y-%m-%d_%H%M")
+    out = RESULTS / f"metrics_raw_{stamp}.json"
     out.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
     scorecard(run)
     detail_csv, summary_csv = write_csv(run, stamp)
-    print(f"\nRaw JSON     -> {out}")
-    print(f"Summary CSV  -> {summary_csv}   (the scorecard, for the meeting)")
+    print(f"\nSummary CSV  -> {summary_csv}   (the scorecard, for the meeting)")
     print(f"Detail CSV   -> {detail_csv}   (per-question, for drill-down)")
+    print(f"Raw JSON     -> {out}")
 
 
 def scorecard(run: Dict):
@@ -272,7 +272,7 @@ DETAIL_COLS = [
 
 def write_csv(run: Dict, stamp: str):
     """Write a per-question detail CSV and a one-row-per-metric summary CSV."""
-    detail = RESULTS / f"{stamp}_detail.csv"
+    detail = RESULTS / f"metrics_detail_{stamp}.csv"
     with detail.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(DETAIL_COLS)
@@ -291,7 +291,7 @@ def write_csv(run: Dict, stamp: str):
                     "|".join(r.get("must_have", [])), "",
                 ])
 
-    summary = RESULTS / f"{stamp}_summary.csv"
+    summary = RESULTS / f"metrics_summary_{stamp}.csv"
     systems = list(run["systems"])
     with summary.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
