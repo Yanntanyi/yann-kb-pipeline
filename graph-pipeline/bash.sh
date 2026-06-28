@@ -5,6 +5,9 @@ orchestrate toolkits add --kind mcp --name ups_watson \
   --tools "*"
 
 
+python3 run_metrics.py --judge
+
+
 orchestrate tools list
 orchestrate agents import -f ../orchestrate/incident_intelligence_agent.yaml
 
