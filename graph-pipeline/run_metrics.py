@@ -1,0 +1,233 @@
+"""run_metrics.py — score the graph system vs the flat-RAG baseline.
+
+Produces the headline numbers for the meeting:
+  1. Intent accuracy     — % of questions routed to an acceptable intent (graph only)
+  2. Retrieval recall     — must-have-doc recall + all-required-hit rate
+  3. Latency              — median/p95 total, plus the pure-graph slice
+  4. Faithfulness/abstain — (with --judge) hallucination-free rate + correct abstention
+  5. Lift over flat RAG   — every metric, side by side with the no-graph baseline
+
+Deterministic metrics (intent, recall, precision, latency) need NO judge and are
+fully reproducible. The --judge layer adds answer-quality grading via the LLM.
+
+Usage (needs Neo4j + Elasticsearch + the LLM up, same as ask.py):
+  python run_metrics.py                         # both systems, deterministic only
+  python run_metrics.py --judge                 # + LLM answer grading
+  python run_metrics.py --systems graph_traversal
+  python run_metrics.py --limit 8               # quick smoke run on first 8 Qs
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+GOLD = Path(__file__).with_name("eval_gold.jsonl")
+RESULTS = Path(__file__).with_name("metrics_results")
+
+
+# ── systems under test ────────────────────────────────────────────────────────
+def build_system(key: str):
+    if key == "graph_traversal":
+        from ask import KnowledgeGraphQuerier
+        return KnowledgeGraphQuerier()
+    if key == "flat_rag":
+        from baseline_rag import FlatRagQuerier
+        return FlatRagQuerier()
+    raise ValueError(key)
+
+
+# ── deterministic scoring ─────────────────────────────────────────────────────
+def score_retrieval(retrieved: List[str], must: List[str], nice: List[str]) -> Dict:
+    """Recall / all-hit / precision against the gold sets (None when N/A)."""
+    rset, mset = set(retrieved), set(must)
+    relevant = mset | set(nice)
+    if not mset:
+        recall, all_hit = None, None  # not a retrieval-scored question
+    else:
+        hits = mset & rset
+        recall = len(hits) / len(mset)
+        all_hit = 1 if mset <= rset else 0
+    precision = (len(rset & relevant) / len(rset)) if (rset and relevant) else None
+    return {"recall": recall, "all_hit": all_hit, "precision": precision}
+
+
+def intent_correct(pred_intent: str, accepted: List[str]) -> Any:
+    if pred_intent in (None, "flat_rag"):
+        return None  # baseline has no intent to score
+    return 1 if pred_intent in accepted else 0
+
+
+# ── optional LLM judge (nugget-based) ─────────────────────────────────────────
+def make_judge():
+    from llm_client import get_llm_client
+    return get_llm_client()
+
+
+def judge_completeness(llm, question: str, answer: str, facts: List[str]) -> Any:
+    if not facts:
+        return None
+    numbered = "\n".join(f"{i+1}. {f}" for i, f in enumerate(facts))
+    prompt = (f"Grade whether the Answer states each required fact (paraphrase counts).\n\n"
+              f"Question: {question}\n\nAnswer:\n\"\"\"{answer}\"\"\"\n\nRequired facts:\n{numbered}\n\n"
+              f'Return ONLY JSON: {{"results":[{{"n":1,"present":true}}, ...]}}')
+    try:
+        out = llm.generate_json(prompt)
+        pres = {r["n"]: bool(r.get("present")) for r in out.get("results", []) if "n" in r}
+        return round(sum(1 for i in range(1, len(facts) + 1) if pres.get(i)) / len(facts), 3)
+    except Exception:
+        return None
+
+
+def judge_faithful(llm, question: str, answer: str, context: str) -> Any:
+    prompt = (f"Does the Answer make any factual claim NOT supported by the Sources? "
+              f"An answer that says info is missing/unknown is faithful.\n\n"
+              f"Question: {question}\n\nSources:\n\"\"\"{context[:12000]}\"\"\"\n\n"
+              f'Answer:\n"""{answer}"""\n\nReturn ONLY JSON: {{"faithful": true|false}}')
+    try:
+        return 1 if bool(llm.generate_json(prompt).get("faithful", True)) else 0
+    except Exception:
+        return None
+
+
+def judge_abstained(llm, question: str, answer: str) -> Any:
+    prompt = (f"Did the Answer correctly indicate the information is unavailable/unknown/"
+              f"not in the documents, rather than inventing it?\n\nQuestion: {question}\n\n"
+              f'Answer:\n"""{answer}"""\n\nReturn ONLY JSON: {{"abstained": true|false}}')
+    try:
+        return 1 if bool(llm.generate_json(prompt).get("abstained", False)) else 0
+    except Exception:
+        return None
+
+
+def read_context(docs_dir: Path, retrieved: List[str]) -> str:
+    parts = []
+    for d in retrieved:
+        try:
+            parts.append((docs_dir / d).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return "\n\n".join(parts)
+
+
+# ── aggregation helpers ───────────────────────────────────────────────────────
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return round(statistics.mean(xs), 3) if xs else None
+
+
+def _pct(xs):
+    xs = [x for x in xs if x is not None]
+    return round(100 * statistics.mean(xs), 1) if xs else None
+
+
+def _median(xs):
+    xs = [x for x in xs if x is not None]
+    return round(statistics.median(xs), 3) if xs else None
+
+
+def _p95(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return round(xs[max(0, int(0.95 * len(xs)) - 1)], 3) if xs else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--systems", nargs="+", default=["graph_traversal", "flat_rag"])
+    ap.add_argument("--judge", action="store_true")
+    ap.add_argument("--ids", nargs="*", default=None)
+    ap.add_argument("--limit", type=int, default=None)
+    args = ap.parse_args()
+
+    gold = [json.loads(l) for l in GOLD.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if args.ids:
+        gold = [g for g in gold if g["id"] in set(args.ids)]
+    if args.limit:
+        gold = gold[: args.limit]
+    print(f"Loaded {len(gold)} gold questions.")
+
+    docs_dir = Path(__file__).resolve().parents[1] / "docs"
+    judge = make_judge() if args.judge else None
+    RESULTS.mkdir(exist_ok=True)
+    run = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "n": len(gold), "systems": {}}
+
+    for skey in args.systems:
+        print(f"\n=== {skey} ===")
+        sysobj = build_system(skey)
+        rows = []
+        try:
+            for g in gold:
+                print(f"  [{g['id']}] {g['question'][:64]}...")
+                try:
+                    res = sysobj.run_query(g["question"])
+                except Exception as e:
+                    print(f"    !! error: {e}")
+                    rows.append({"id": g["id"], "error": str(e)})
+                    continue
+                retrieved = [n["filepath"] for n in res.get("path", [])]
+                row = {
+                    "id": g["id"], "category_intents": g["intents"],
+                    "intent_ok": intent_correct(res.get("intent"), g["intents"]),
+                    **score_retrieval(retrieved, g["must_have"], g.get("nice_to_have", [])),
+                    "latency": res.get("timing", {}).get("total"),
+                    "graph_latency": res.get("timing", {}).get("traverse"),
+                    "must_abstain": g["must_abstain"],
+                }
+                if judge is not None:
+                    ctx = read_context(docs_dir, retrieved)
+                    row["completeness"] = judge_completeness(judge, g["question"], res["answer"], g["key_facts"])
+                    row["faithful"] = judge_faithful(judge, g["question"], res["answer"], ctx)
+                    if g["must_abstain"]:
+                        row["abstained"] = judge_abstained(judge, g["question"], res["answer"])
+                rows.append(row)
+        finally:
+            if hasattr(sysobj, "close"):
+                sysobj.close()
+        run["systems"][skey] = rows
+
+    out = RESULTS / f"{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
+    scorecard(run)
+    print(f"\nRaw results -> {out}")
+
+
+def scorecard(run: Dict):
+    print("\n" + "=" * 76)
+    print("SCORECARD" + (" (with judge)" if any("faithful" in r for rows in run["systems"].values() for r in rows if "error" not in r) else ""))
+    print("=" * 76)
+    hdr = f"{'metric':<34}" + "".join(f"{s[:18]:>20}" for s in run["systems"])
+    print(hdr); print("-" * len(hdr))
+
+    def line(label, fn):
+        row = f"{label:<34}"
+        for s in run["systems"]:
+            ok = [r for r in run["systems"][s] if "error" not in r]
+            v = fn(ok)
+            row += f"{('—' if v is None else v):>20}"
+        print(row)
+
+    line("Intent accuracy %", lambda ok: _pct([r["intent_ok"] for r in ok]))
+    line("Must-have recall % (avg)", lambda ok: _pct([r["recall"] for r in ok]))
+    line("All-required-hit rate %", lambda ok: _pct([r["all_hit"] for r in ok]))
+    line("Precision % (avg)", lambda ok: _pct([r["precision"] for r in ok]))
+    line("Latency median (s)", lambda ok: _median([r["latency"] for r in ok]))
+    line("Latency p95 (s)", lambda ok: _p95([r["latency"] for r in ok]))
+    line("Graph-walk median (s)", lambda ok: _median([r["graph_latency"] for r in ok]))
+    if any("faithful" in r for rows in run["systems"].values() for r in rows if "error" not in r):
+        line("Faithful % (no hallucination)", lambda ok: _pct([r.get("faithful") for r in ok]))
+        line("Completeness % (key facts)", lambda ok: _pct([r.get("completeness") for r in ok]))
+        line("Correct abstention %", lambda ok: _pct([r.get("abstained") for r in ok if r.get("must_abstain")]))
+
+    n_err = {s: sum(1 for r in rows if "error" in r) for s, rows in run["systems"].items()}
+    if any(n_err.values()):
+        print("\nsystem errors:", {k: v for k, v in n_err.items() if v})
+    print("\nNote: recall/precision computed only over questions with required docs; "
+          "intent accuracy is graph-only (the baseline has no intent).")
+
+
+if __name__ == "__main__":
+    main()
