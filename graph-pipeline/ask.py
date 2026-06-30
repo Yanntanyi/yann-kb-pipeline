@@ -61,10 +61,10 @@ MAX_HOPS = 7   # maximum graph edges followed beyond the seeds
 # Index in the list = priority rank (lower index = follow first).
 # Edge types not in the list for a given intent are not followed.
 EDGE_PRIORITIES: Dict[str, List[str]] = {
-    "causal":     ["PRECEDED_BY", "PROVIDES_CONTEXT_FOR", "SUPPORTS"],
-    "resolution": ["IMPLEMENTS", "REFERENCES", "PROVIDES_CONTEXT_FOR"],
-    "timeline":   ["PRECEDED_BY", "REFERENCES"],
-    "similar":    ["SUPPORTS", "SHARES_DOMAIN_WITH", "EXTENDS"],
+    "causal":     ["CAUSED_BY", "PRECEDED_BY", "PROVIDES_CONTEXT_FOR"],
+    "resolution": ["REMEDIATED_BY", "REFERENCES", "PROVIDES_CONTEXT_FOR"],
+    "timeline":   ["PRECEDED_BY", "CAUSED_BY", "REFERENCES"],
+    "similar":    ["RECURRENCE_OF", "PROVIDES_CONTEXT_FOR"],
 }
 
 INTENT_DESCRIPTIONS = {
@@ -464,9 +464,14 @@ Answer:"""
                 "MATCH (e:Entity) WHERE e.entity_type IS NOT NULL "
                 "RETURN DISTINCT e.entity_type AS t ORDER BY t"
             )
-            self._entity_types_cache = [r["t"] for r in rows if r.get("t")]
+            generic = [r["t"] for r in rows if r.get("t")]
+            # The curated semantic-layer pivots are always offered as dimensions so
+            # the classifier routes "which team / which component" to exact counts.
+            semantic = [k for k in self.SEMANTIC_DIMENSIONS
+                        if not any(k == g.lower() for g in generic)]
+            self._entity_types_cache = semantic + generic
         except Exception:
-            self._entity_types_cache = []
+            self._entity_types_cache = list(self.SEMANTIC_DIMENSIONS)
         return self._entity_types_cache
 
     def plan_thematic(self, query: str) -> Dict[str, Any]:
@@ -499,6 +504,48 @@ Return ONLY valid JSON:
         except Exception:
             raw = {}
         return self._normalize_plan(raw)
+
+    # Semantic-layer pivots: a dimension name -> (node label, edge type). These are
+    # exact-count dimensions backed by first-class typed nodes (the read-wide
+    # business pivots), as opposed to the generic Entity/MENTIONS aggregation.
+    SEMANTIC_DIMENSIONS = {
+        "component": ("Component", "AFFECTS"),
+        "team": ("Team", "INVOLVED"),
+    }
+
+    def _aggregate_dimension(
+        self, dimension: Any, top_n: int = THEMATIC_TOP_N
+    ) -> List[Dict[str, Any]]:
+        """Route a corpus-wide count to the right backing structure: the curated
+        Component/Team semantic layer when the dimension is one of those, else the
+        generic Entity/MENTIONS aggregation."""
+        key = str(dimension).lower().strip() if dimension else None
+        if key in self.SEMANTIC_DIMENSIONS:
+            label, edge = self.SEMANTIC_DIMENSIONS[key]
+            return self.aggregate_semantic(label, edge, top_n)
+        return self.aggregate_entities(dimension, top_n)
+
+    def aggregate_semantic(
+        self, label: str, edge: str, top_n: int = THEMATIC_TOP_N
+    ) -> List[Dict[str, Any]]:
+        """Exact corpus-wide count of documents per Component/Team node.
+
+        label/edge are whitelisted against SEMANTIC_DIMENSIONS before being put
+        into the query string (Neo4j can't parameterize labels/edge types)."""
+        valid = {(lbl, e) for lbl, e in self.SEMANTIC_DIMENSIONS.values()}
+        if (label, edge) not in valid:
+            return []
+        return self.neo4j.query_graph(
+            f"""
+            MATCH (d:Document)-[:{edge}]->(x:{label})
+            RETURN x.name AS name, '{label}' AS type,
+                   count(DISTINCT d) AS doc_count,
+                   collect(DISTINCT d.filepath)[..8] AS docs
+            ORDER BY doc_count DESC, name ASC
+            LIMIT $top_n
+            """,
+            top_n=top_n,
+        )
 
     def aggregate_entities(
         self, entity_type: Any, top_n: int = THEMATIC_TOP_N
@@ -542,9 +589,13 @@ Return ONLY valid JSON:
                 WHERE any(t IN d.topics   WHERE toLower(t) CONTAINS $theme)
                    OR any(x IN d.entities WHERE toLower(x) CONTAINS $theme)
                    OR any(n IN enames     WHERE n CONTAINS $theme)
+                   OR any(c IN d.components WHERE toLower(c) CONTAINS $theme)
                    OR toLower(d.filepath) CONTAINS $theme
-                RETURN d.filepath AS filepath, d.date AS date,
-                       d.topics AS topics, d.entities AS entities
+                RETURN d.filepath AS filepath, d.date AS date, d.doc_type AS doc_type,
+                       d.topics AS topics, d.entities AS entities,
+                       d.components AS components, d.teams AS teams,
+                       d.root_cause AS root_cause, d.resolution AS resolution,
+                       d.status AS status, d.customer_impact AS customer_impact
                 ORDER BY d.date DESC, d.filepath
                 LIMIT $limit
                 """,
@@ -555,8 +606,11 @@ Return ONLY valid JSON:
             """
             MATCH (d:Document)
             WHERE toLower(d.filepath) STARTS WITH 'rca/'
-            RETURN d.filepath AS filepath, d.date AS date,
-                   d.topics AS topics, d.entities AS entities
+            RETURN d.filepath AS filepath, d.date AS date, d.doc_type AS doc_type,
+                   d.topics AS topics, d.entities AS entities,
+                   d.components AS components, d.teams AS teams,
+                   d.root_cause AS root_cause, d.resolution AS resolution,
+                   d.status AS status, d.customer_impact AS customer_impact
             ORDER BY d.date DESC, d.filepath
             LIMIT $limit
             """,
@@ -564,16 +618,34 @@ Return ONLY valid JSON:
         )
 
     def _build_thematic_context(self, rows: List[Dict[str, Any]]) -> str:
-        """Build a compact digest (one short block per doc) from graph fingerprints."""
+        """Build a compact digest (one block per doc) from each node's stored
+        incident facts. With the domain schema the block now carries root_cause,
+        resolution, status, customer_impact, components and teams — so corpus-wide
+        synthesis can answer "contributing factors / who resolved it / which are
+        still open" from the fingerprint itself. Fields absent on older nodes
+        (pre-rebuild) are simply skipped, so this degrades to topics+entities."""
         sections = []
         for i, r in enumerate(rows, 1):
-            topics = ", ".join(r.get("topics") or []) or "—"
-            entities = ", ".join(r.get("entities") or []) or "—"
             date = r.get("date") or "n/a"
-            sections.append(
-                f"[Doc {i}: {r['filepath']} | date: {date}]\n"
-                f"  topics: {topics}\n  entities: {entities}"
-            )
+            dtype = r.get("doc_type") or "doc"
+            lines = [f"[Doc {i}: {r['filepath']} | {dtype} | date: {date}]"]
+
+            def add(label: str, val: Any):
+                if not val:
+                    return
+                if isinstance(val, list):
+                    val = ", ".join(str(x) for x in val)
+                lines.append(f"  {label}: {val}")
+
+            add("topics", r.get("topics"))
+            add("components", r.get("components"))
+            add("teams", r.get("teams"))
+            add("root cause", r.get("root_cause"))
+            add("resolution", r.get("resolution"))
+            add("customer impact", r.get("customer_impact"))
+            add("status", r.get("status"))
+            add("entities", r.get("entities"))  # longest, kept last
+            sections.append("\n".join(lines))
         return "\n\n".join(sections)
 
     def answer_entity_count(
@@ -637,7 +709,7 @@ Answer:"""
 
         if plan["mode"] == "entity_count":
             with _timed(timing, "aggregate"):
-                counts = self.aggregate_entities(plan["entity_type"])
+                counts = self._aggregate_dimension(plan["entity_type"])
             if counts:
                 with _timed(timing, "answer"):
                     answer = self.answer_entity_count(query, plan["entity_type"], counts)
