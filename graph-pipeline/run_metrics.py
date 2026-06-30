@@ -246,6 +246,7 @@ def main():
     out = RESULTS / f"metrics_raw_{stamp}.json"
     out.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
     scorecard(run)
+    traversal_panel(run)
     business_panel(run)
     detail_csv, summary_csv = write_csv(run, stamp)
     print(f"\nSummary CSV  -> {summary_csv}   (the scorecard, for the meeting)")
@@ -285,6 +286,41 @@ def scorecard(run: Dict):
         print("\nsystem errors:", {k: v for k, v in n_err.items() if v})
     print("\nNote: recall/precision computed only over questions with required docs; "
           "intent accuracy is graph-only (the baseline has no intent).")
+
+
+def traversal_panel(run: Dict):
+    """The read-deep scorecard: single-incident (traversal) questions only — where
+    augment-not-replace applies. Isolating these from the thematic questions is the
+    only way to see the augment effect; the overall scorecard blends the two and the
+    fingerprint-based thematic path drags every graph number down.
+
+    Because the graph base IS flat-RAG's top-K (plus bridges), graph recall here
+    should be >= flat RAG. If it isn't, the base retrieval is not matching flat RAG.
+    """
+    def trav(rows):
+        return [r for r in rows if "error" not in r and not r.get("is_thematic")]
+
+    n = max((len(trav(rows)) for rows in run["systems"].values()), default=0)
+    print("\n" + "=" * 76)
+    print(f"TRAVERSAL PANEL — single-incident questions only, where augment applies (n={n})")
+    print("=" * 76)
+    hdr = f"{'metric':<34}" + "".join(f"{s[:18]:>20}" for s in run["systems"])
+    print(hdr); print("-" * len(hdr))
+
+    def line(label, fn):
+        row = f"{label:<34}"
+        for s in run["systems"]:
+            v = fn(trav(run["systems"][s]))
+            row += f"{('—' if v is None else v):>20}"
+        print(row)
+
+    line("Must-have recall % (avg)", lambda ok: _pct([r["recall"] for r in ok]))
+    line("All-required-hit rate %", lambda ok: _pct([r["all_hit"] for r in ok]))
+    line("Precision % (avg)", lambda ok: _pct([r["precision"] for r in ok]))
+    if any("completeness" in r for rows in run["systems"].values() for r in trav(rows)):
+        line("Completeness % (key facts)", lambda ok: _pct([r.get("completeness") for r in ok]))
+        line("Faithful % (no hallucination)", lambda ok: _pct([r.get("faithful") for r in ok]))
+    print("\nGraph base = flat-RAG top-K + bridges, so graph recall here should be >= flat RAG.")
 
 
 def business_panel(run: Dict):
