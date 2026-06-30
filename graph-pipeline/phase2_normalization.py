@@ -114,20 +114,83 @@ Return ONLY the JSON object, no explanations."""
             return {n: n for n in uniq}
 
     def normalize_list_field(self, extractions: Dict[str, Any], field: str) -> Dict[str, str]:
-        """Build a raw->canonical map for a list field across the whole corpus."""
+        """Build a raw->canonical map for a list field across the whole corpus.
+
+        Aliases are grouped by EMBEDDING similarity before the LLM sees them, so
+        different spellings of the same thing ("Voice Gateway", "IBM Voice Gateway",
+        "VoiceGateway") land in the same batch regardless of alphabetical position —
+        the failure mode of the old sorted-batch approach. The LLM still arbitrates
+        every merge, so similar-but-distinct names (PROD vs Non-Prod cluster) stay
+        separate even when they share a batch.
+        """
         names: List[str] = []
         for doc_data in extractions.values():
             names.extend(doc_data["extraction"].get(field) or [])
-        # Sort so similar spellings land in the same 30-item batch (batching can't
-        # merge aliases that never appear together).
-        uniq = sorted(dict.fromkeys(n for n in names if n and str(n).strip()),
-                      key=lambda s: str(s).casefold())
+        uniq = list(dict.fromkeys(n for n in names if n and str(n).strip()))
         print(f"Normalizing {len(uniq)} unique '{field}' values...")
+        if not uniq:
+            self._save_field_mapping(field, {})
+            return {}
         mapping: Dict[str, str] = {}
-        for i in range(0, len(uniq), 30):
-            mapping.update(self.normalize_names_batch(uniq[i:i + 30], kind=field))
+        for batch in self._similarity_batches(uniq):
+            mapping.update(self.normalize_names_batch(batch, kind=field))
         self._save_field_mapping(field, mapping)
         return mapping
+
+    def _embed_all(self, names: List[str]) -> List[List[float]]:
+        """Embed names in provider-safe chunks."""
+        vecs: List[List[float]] = []
+        bs = max(1, int(getattr(config, "WATSONX_EMBED_BATCH", 100)))
+        for i in range(0, len(names), bs):
+            vecs.extend(self.llm.embed(names[i:i + bs]))
+        return vecs
+
+    def _similarity_batches(
+        self, names: List[str], threshold: float = 0.74, max_batch: int = 30
+    ) -> List[List[str]]:
+        """Group names so embedding-neighbors share a batch, capped at max_batch
+        (the output-token ceiling that forced batching in the first place).
+
+        Falls back to alphabetical batching if embeddings/numpy are unavailable —
+        no worse than before, never errors the pipeline.
+        """
+        try:
+            import numpy as np
+            vecs = np.asarray(self._embed_all(names), dtype=float)
+            vecs /= np.clip(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-9, None)
+        except Exception as e:
+            print(f"  (embedding clustering unavailable: {e}; using sorted batches)")
+            s = sorted(names, key=lambda x: str(x).casefold())
+            return [s[i:i + max_batch] for i in range(0, len(s), max_batch)]
+
+        # Greedy single-pass clustering: assign each name to the nearest existing
+        # cluster representative above threshold, else start a new cluster.
+        reps: List[Any] = []
+        clusters: List[List[int]] = []
+        for i in range(len(names)):
+            if reps:
+                sims = np.asarray(reps) @ vecs[i]
+                j = int(np.argmax(sims))
+                if sims[j] >= threshold:
+                    clusters[j].append(i)
+                    continue
+            reps.append(vecs[i])
+            clusters.append([i])
+
+        # Pack whole clusters into batches <= max_batch; split any oversized cluster.
+        batches: List[List[str]] = []
+        cur: List[str] = []
+        for members in sorted(clusters, key=len, reverse=True):
+            grp = [names[k] for k in members]
+            for s in range(0, len(grp), max_batch):
+                chunk = grp[s:s + max_batch]
+                if cur and len(cur) + len(chunk) > max_batch:
+                    batches.append(cur)
+                    cur = []
+                cur.extend(chunk)
+        if cur:
+            batches.append(cur)
+        return batches
 
     def _save_field_mapping(self, field: str, mapping: Dict[str, str]):
         path = config.STAGING_DIR / f"phase2_{field}_normalized.json"
