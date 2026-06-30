@@ -116,3 +116,17 @@ NUM_SEEDS = int(_env("NUM_SEEDS", default="3"))
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASSWORD = "password1234"  # set this to your actual Neo4j password
+
+# ── Shared answer-generation instructions ────────────────────────────────────
+# Used by BOTH the graph system and the flat-RAG baseline so the head-to-head
+# comparison measures RETRIEVAL, not answer wording. (Previously the graph prompt
+# capped length — "a few tight bullet points; do NOT pad" — while the baseline did
+# not, which confounded the completeness metric: the graph was penalized for being
+# told to be terse, not for missing content.)
+ANSWER_INSTRUCTIONS = """Instructions:
+- Lead with the direct answer in the first sentence. No preamble, no restating the question.
+- Cover all the specific facts the question asks for — if it asks to trace a chain, give every step; if it asks for several items, include them all. Be complete, but do not pad with background the question didn't ask for.
+- Cite specific document names, dates, and components where they matter.
+- You may use light Markdown (**bold**, "- " bullets); it will be rendered.
+- If the documents don't fully answer the question, say so. Do not introduce outside information.
+- Output only the final answer, not your reasoning."""
