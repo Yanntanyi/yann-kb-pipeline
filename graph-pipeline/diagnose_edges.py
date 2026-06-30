@@ -24,8 +24,8 @@ GOLD = Path(__file__).with_name("eval_relationships.jsonl")
 
 # Document<->Document edge types only (exclude MENTIONS, which bridges via Entity
 # nodes — we want to know if a real relationship edge exists, not an entity overlap).
-DOC_RELS = ("EXTENDS|CONTRADICTS|SUPPORTS|REFERENCES|PROVIDES_CONTEXT_FOR|"
-            "SHARES_DOMAIN_WITH|IMPLEMENTS|PRECEDED_BY|RELATED_TO")
+DOC_RELS = ("CAUSED_BY|REMEDIATED_BY|RECURRENCE_OF|REFERENCES|"
+            "PROVIDES_CONTEXT_FOR|PRECEDED_BY|RELATED_TO")
 
 
 def node_exists(neo4j, fp: str) -> bool:
