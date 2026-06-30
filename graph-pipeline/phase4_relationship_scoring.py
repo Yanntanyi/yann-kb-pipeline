@@ -78,22 +78,20 @@ DOCUMENT 2 ({filepath2}):
 
 Evaluate their relationship and return ONLY valid JSON:
 {{
-  "relationship_type": "one of: EXTENDS, CONTRADICTS, SUPPORTS, REFERENCES, PROVIDES_CONTEXT_FOR, SHARES_DOMAIN_WITH, IMPLEMENTS, NONE",
+  "relationship_type": "one of: CAUSED_BY, REMEDIATED_BY, RECURRENCE_OF, REFERENCES, PROVIDES_CONTEXT_FOR, NONE",
   "strength": <integer 1-10, where 10 is strongest>,
   "directionality": "one of: symmetric, doc1_to_doc2, doc2_to_doc1",
   "confidence": "one of: high, medium, low",
   "description": "see instructions below"
 }}
 
-Relationship type definitions:
-- EXTENDS: One document builds upon or extends concepts from the other
-- CONTRADICTS: Documents present conflicting information or approaches
-- SUPPORTS: One document corroborates or provides evidence for the other
-- REFERENCES: One document explicitly cites or links to the other
-- PROVIDES_CONTEXT_FOR: One document gives the background needed to understand the other
-- SHARES_DOMAIN_WITH: Same domain or technology area, but no direct relationship
-- IMPLEMENTS: One document is the action taken as a result of the other
-- NONE: No meaningful relationship — use this if the connection is weak or incidental
+Relationship type definitions (incident-management domain):
+- CAUSED_BY: One document describes a change or event that CAUSED the problem/incident in the other (e.g. a change request that triggered an outage). Set directionality from cause → effect.
+- REMEDIATED_BY: One document is the change or action taken to FIX or remediate the incident in the other. Set directionality from incident → remediation.
+- RECURRENCE_OF: The two documents describe the SAME underlying failure mode recurring (same mechanism, different occurrence) — even if surface details differ.
+- REFERENCES: One document explicitly cites, links, or names the other (e.g. shared ticket/case ID, a direct cross-reference).
+- PROVIDES_CONTEXT_FOR: One document supplies background needed to understand the other, without a direct causal/remediation link.
+- NONE: No meaningful relationship — use this if the connection is weak, incidental, or merely "same technology area". Be conservative; prefer NONE over a vague link.
 
 For the description field:
 Write one sentence from the perspective of someone who has just finished reading
