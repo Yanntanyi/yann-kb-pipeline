@@ -92,12 +92,16 @@ INTENT_DESCRIPTIONS = {
 VALID_INTENTS = set(EDGE_PRIORITIES) | {"thematic"}
 
 # ── Thematic (corpus-wide) parameters ─────────────────────────────────────────
-# Speed note: thematic answers aggregate over each document's *distilled* graph
-# fingerprint (topics + entities + date), NOT its full text. That keeps the synthesis
-# input tiny (~tens of tokens per doc) so we can read the whole corpus cheaply — the
-# graph already did the expensive reading at build time.
+# theme_synthesis reads the matching set HYBRID: the most query-relevant documents
+# in FULL TEXT (depth — so it can state specific facts, contributing factors,
+# resolution detail), and the rest as compact graph fingerprints (breadth — so it
+# can still count and find patterns across the whole set). Pure fingerprints lost to
+# flat RAG on "state this specific fact" questions; full text for everything is too
+# many tokens. The hybrid gets both, and the corpus is small enough that it's cheap.
 THEMATIC_TOP_N = 12        # entities returned by an entity_count aggregation
-THEMATIC_MAX_DOCS = 50     # documents summarised for a theme_synthesis (no walk cap)
+THEMATIC_MAX_DOCS = 50     # documents in the matching set for a theme_synthesis
+THEMATIC_FULLTEXT_N = 12   # of those, how many (most query-relevant) to read in FULL
+                           # TEXT; the remainder are read as compact fingerprints
 THEMATIC_ANSWER_TOKENS = 4096  # max_tokens is a CEILING, not a target: the prompt
 # still asks for a short list/count, so answers stay concise. gpt-oss is a reasoning
 # model whose hidden "thinking" tokens count against max_tokens, so a tight budget can
@@ -719,6 +723,44 @@ Return ONLY valid JSON:
             sections.append("\n".join(lines))
         return "\n\n".join(sections)
 
+    def _rank_rows_by_relevance(
+        self, query: str, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Order the matching set by relevance to the query (most relevant first),
+        so the hybrid reader can pick which few to read in full. Uses embeddings of
+        each doc's fingerprint vs the query; degrades to the original order if
+        embeddings are unavailable."""
+        if len(rows) <= 1:
+            return rows
+        texts = []
+        for r in rows:
+            parts = list(r.get("topics") or []) + list(r.get("components") or [])
+            parts += list(r.get("teams") or [])
+            for f in ("root_cause", "resolution", "customer_impact"):
+                if r.get(f):
+                    parts.append(str(r[f]))
+            texts.append(" ".join(parts) or r["filepath"])
+        try:
+            import numpy as np
+            vecs = np.asarray(self.llm.embed([query] + texts), dtype=float)
+            vecs /= np.clip(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-9, None)
+            sims = vecs[1:] @ vecs[0]
+            return [rows[i] for i in np.argsort(-sims)]
+        except Exception as e:
+            print(f"  (relevance ranking unavailable: {e}; using gather order)")
+            return rows
+
+    def _read_fulltext(self, filepaths: List[str]) -> str:
+        """Read the full text of each document, with a header per doc."""
+        sections = []
+        for i, fp in enumerate(filepaths, 1):
+            try:
+                text = (config.DOCUMENTS_DIR / fp).read_text(encoding="utf-8")
+            except Exception:
+                continue
+            sections.append(f"[Document {i}: {fp}]\n\n{text}")
+        return ("\n\n" + "─" * 60 + "\n\n").join(sections)
+
     def answer_entity_count(
         self, query: str, entity_type: Any, counts: List[Dict[str, Any]]
     ) -> str:
@@ -741,27 +783,38 @@ Write a brief, direct answer (1-3 sentences or a short ranked list) grounded in 
         return self.llm.generate_text(prompt, max_tokens=THEMATIC_ANSWER_TOKENS)
 
     def answer_theme_synthesis(
-        self, query: str, theme: Any, context: str, filepaths: List[str]
+        self, query: str, theme: Any, fulltext: str, summaries: str,
+        n_full: int, n_total: int
     ) -> str:
-        """Aggregate/pattern over the FULL gathered set of summaries in one LLM call."""
-        if not context.strip():
+        """Aggregate/pattern over the matching set in one LLM call, reading the most
+        relevant docs in FULL and the rest as compact fingerprints (the hybrid)."""
+        if not fulltext.strip() and not summaries.strip():
             suffix = f" for the theme '{theme}'." if theme else "."
             return (
                 "No documents in the knowledge graph matched this question" + suffix
             )
         scope = f"documents related to '{theme}'" if theme else "all incident reports"
-        prompt = f"""You are answering a corpus-wide question by aggregating across {scope}. Below is the COMPLETE set of matching documents ({len(filepaths)} total), each given as a compact summary (its topics and named entities). Count and find patterns across all of them.
+        full_block = (
+            f"FULL TEXT of the {n_full} most relevant documents (use these for specific "
+            f"facts — contributing factors, resolution detail, impact, timelines):\n\n{fulltext}"
+            if fulltext.strip() else ""
+        )
+        summary_block = (
+            f"\n\nCOMPACT SUMMARIES of the remaining matching documents (use these for "
+            f"counting and breadth across the whole set):\n\n{summaries}"
+            if summaries.strip() else ""
+        )
+        prompt = f"""You are answering a corpus-wide question by aggregating across {scope}. The matching set is {n_total} documents total. Below, the most relevant ones are given in FULL TEXT, and the rest as compact summaries.
 
 Question: {query}
 
-Document summaries:
-{context}
+{full_block}{summary_block}
 
 Instructions:
 - Lead with the direct answer; no preamble or restating the question. Keep it concise — a short summary or tight ranked list, not an essay.
-- Aggregate across ALL the summaries — count, rank, or describe the recurring pattern as asked. Give counts (e.g. "X of {len(filepaths)} documents…") and cite document names where relevant.
+- For SPECIFIC facts (root causes, contributing factors, resolution steps, who was involved), rely on the full-text documents. For COUNTS and patterns across the set, use the summaries too (e.g. "X of {n_total} documents…"). Cite document names where relevant.
 - You may use light Markdown (**bold**, "- " bullets); it will be rendered.
-- Base claims only on the summaries. If a detail isn't captured (e.g. a contributing factor not listed as a topic), say it isn't determinable from the summary view rather than guessing.
+- Base claims only on what is provided. If a detail isn't present, say so rather than guessing.
 - Output only the final answer, not your reasoning.
 
 Answer:"""
@@ -816,9 +869,19 @@ Answer:"""
         with _timed(timing, "gather"):
             rows = self.gather_thematic_set(plan.get("theme"))
         filepaths = [r["filepath"] for r in rows]
-        context = self._build_thematic_context(rows)
+        # Hybrid read: full text for the most query-relevant docs (depth), compact
+        # fingerprints for the rest of the matching set (breadth/counting).
+        with _timed(timing, "rank"):
+            ranked = self._rank_rows_by_relevance(query, rows)
+        deep_rows = ranked[:THEMATIC_FULLTEXT_N]
+        rest_rows = ranked[THEMATIC_FULLTEXT_N:]
+        fulltext = self._read_fulltext([r["filepath"] for r in deep_rows])
+        summaries = self._build_thematic_context(rest_rows)
         with _timed(timing, "answer"):
-            answer = self.answer_theme_synthesis(query, plan.get("theme"), context, filepaths)
+            answer = self.answer_theme_synthesis(
+                query, plan.get("theme"), fulltext, summaries,
+                len(deep_rows), len(filepaths),
+            )
         label = (f"matched theme '{plan['theme']}'" if plan.get("theme")
                  else "incident document (corpus-wide analysis)")
         path = [
