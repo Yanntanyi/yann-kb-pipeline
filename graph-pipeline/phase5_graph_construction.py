@@ -95,10 +95,11 @@ class GraphConstructor:
 
         Steps:
           1  Filter + cap relationships
-          2  Create Document nodes
+          2  Create Document nodes (with full incident-domain properties)
           3  Create Document→Document relationship edges
-          4  Create Entity nodes + MENTIONS edges       ← new
-          5  Create PRECEDED_BY temporal edges          ← new
+          4  Create Entity nodes + MENTIONS edges
+          5  Create PRECEDED_BY temporal edges
+          6  Build semantic layer: Component / Team nodes + AFFECTS / INVOLVED edges
         """
         self.neo4j.initialize_schema()
 
@@ -112,16 +113,15 @@ class GraphConstructor:
         print(f"  After degree cap:       {len(final_relationships)} relationships")
 
         # ── Step 2: Document nodes ────────────────────────────────────────────
+        # The whole extraction map (entities, topics, date, doc_type, root_cause,
+        # resolution, status, customer_impact, components, teams, …) is stored on
+        # the node, so the corpus-wide thematic path can read real incident facts.
         print(f"\nCreating {len(extractions)} document nodes...")
         for doc_hash, doc_data in extractions.items():
-            extraction = doc_data["extraction"]
             self.neo4j.create_document_node(
                 doc_hash=doc_hash,
                 filepath=doc_data["filepath"],
-                entities=extraction["entities"],
-                topics=extraction["topics"],
-                stance=extraction["stance"],
-                date=extraction.get("date"),   # new — stored from Phase 1
+                properties=doc_data["extraction"],
             )
         print("Document nodes created")
 
@@ -171,7 +171,70 @@ class GraphConstructor:
         temporal_count = self._create_temporal_edges(extractions, final_relationships)
         print(f"  Created {temporal_count} PRECEDED_BY edges")
 
+        # ── Step 6: Semantic layer — Component / Team nodes (new) ──────────────
+        print("\nBuilding semantic layer (Component / Team nodes)...")
+        self._build_semantic_layer(extractions)
+
         self.print_graph_statistics()
+
+    # ── Semantic layer ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _canonicalize_field(extractions: Dict[str, Any], field: str) -> Dict[str, List[str]]:
+        """Globally de-duplicate a list field (components/teams) across the whole
+        corpus so the same real-world thing becomes ONE node.
+
+        Canonical key = casefolded, whitespace-collapsed string; the display name
+        is the first spelling seen. Done globally (not per-doc) for the same
+        anti-first-mover reason entity normalization is global. Returns
+        {doc_hash: [canonical display names]}.
+        """
+        import re
+
+        display_for_key: Dict[str, str] = {}
+        for doc in extractions.values():
+            for raw in doc["extraction"].get(field) or []:
+                key = re.sub(r"\s+", " ", str(raw).strip()).casefold()
+                if key and key not in display_for_key:
+                    display_for_key[key] = re.sub(r"\s+", " ", str(raw).strip())
+
+        per_doc: Dict[str, List[str]] = {}
+        for doc_hash, doc in extractions.items():
+            seen, names = set(), []
+            for raw in doc["extraction"].get(field) or []:
+                key = re.sub(r"\s+", " ", str(raw).strip()).casefold()
+                name = display_for_key.get(key)
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            per_doc[doc_hash] = names
+        return per_doc
+
+    def _build_semantic_layer(self, extractions: Dict[str, Any]):
+        """Promote the curated components/teams fields into typed nodes + edges:
+        Document-[:AFFECTS]->Component and Document-[:INVOLVED]->Team. This is what
+        makes the read-wide pivots ("which component fails most", "which team is
+        engaged most") native exact Cypher counts instead of LLM guesses."""
+        comp_by_doc = self._canonicalize_field(extractions, "components")
+        team_by_doc = self._canonicalize_field(extractions, "teams")
+
+        for name in {n for names in comp_by_doc.values() for n in names}:
+            self.neo4j.create_component_node(name)
+        for name in {n for names in team_by_doc.values() for n in names}:
+            self.neo4j.create_team_node(name)
+
+        affects = involved = 0
+        for doc_hash in extractions:
+            for name in comp_by_doc.get(doc_hash, []):
+                self.neo4j.link_affects(doc_hash, name)
+                affects += 1
+            for name in team_by_doc.get(doc_hash, []):
+                self.neo4j.link_involved(doc_hash, name)
+                involved += 1
+        n_comp = len({n for names in comp_by_doc.values() for n in names})
+        n_team = len({n for names in team_by_doc.values() for n in names})
+        print(f"  {n_comp} Component nodes ({affects} AFFECTS), "
+              f"{n_team} Team nodes ({involved} INVOLVED)")
 
     def _create_temporal_edges(
         self, extractions: Dict[str, Any], relationships: List[Dict[str, Any]]
