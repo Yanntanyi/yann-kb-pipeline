@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import statistics
 import time
 from pathlib import Path
@@ -63,6 +64,41 @@ def intent_correct(pred_intent: str, accepted: List[str]) -> Any:
     if pred_intent in (None, "flat_rag"):
         return None  # baseline has no intent to score
     return 1 if pred_intent in accepted else 0
+
+
+# ── business-lens scoring (read-wide: the graph-exclusive advantages) ──────────
+# These isolate what a top-K retriever physically cannot do on corpus-wide
+# questions: state an EXACT count, and ground on the WHOLE relevant set (not just
+# the top 10 docs). Both are deterministic — no judge needed.
+
+_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+
+def _numbers_in(text: str) -> List[int]:
+    """Every integer mentioned in the answer (digits + spelled-out one..twelve)."""
+    nums = [int(n.replace(",", "")) for n in re.findall(r"\b\d[\d,]*\b", text or "")]
+    low = (text or "").lower()
+    nums += [v for w, v in _NUM_WORDS.items() if re.search(rf"\b{w}\b", low)]
+    return nums
+
+
+def score_counts(answer: str, targets: List[Dict[str, Any]]) -> Any:
+    """Fraction of ground-truth counts the answer actually states (None if N/A).
+
+    A target is hit if some number in the answer lands within its tolerance. This
+    is the headline business metric: flat RAG can't count past its 10-doc window.
+    """
+    if not targets:
+        return None
+    nums = _numbers_in(answer)
+    hits = sum(
+        1 for t in targets
+        if any(abs(n - t["value"]) <= t.get("tol", 0) for n in nums)
+    )
+    return round(hits / len(targets), 3)
 
 
 # ── optional LLM judge (nugget-based) ─────────────────────────────────────────
@@ -185,6 +221,9 @@ def main():
                     "category_intents": g["intents"], "intent_pred": res.get("intent"),
                     "intent_ok": intent_correct(res.get("intent"), g["intents"]),
                     **score_retrieval(retrieved, g["must_have"], g.get("nice_to_have", [])),
+                    "count_acc": score_counts(res.get("answer", ""), g.get("expected_counts", [])),
+                    "breadth": len(retrieved),  # docs the answer is grounded on
+                    "is_thematic": "thematic" in g["intents"],
                     "latency": res.get("timing", {}).get("total"),
                     "graph_latency": res.get("timing", {}).get("traverse"),
                     "must_abstain": g["must_abstain"],
@@ -207,6 +246,7 @@ def main():
     out = RESULTS / f"metrics_raw_{stamp}.json"
     out.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
     scorecard(run)
+    business_panel(run)
     detail_csv, summary_csv = write_csv(run, stamp)
     print(f"\nSummary CSV  -> {summary_csv}   (the scorecard, for the meeting)")
     print(f"Detail CSV   -> {detail_csv}   (per-question, for drill-down)")
@@ -247,10 +287,50 @@ def scorecard(run: Dict):
           "intent accuracy is graph-only (the baseline has no intent).")
 
 
+def business_panel(run: Dict):
+    """The read-wide scorecard: corpus-wide (thematic) questions only.
+
+    This is the business persona's acceptance test — the things a top-K retriever
+    structurally cannot do. Count accuracy and corpus breadth are where the graph's
+    aggregation path is expected to beat the flat baseline outright.
+    """
+    def thematic(rows):
+        return [r for r in rows if "error" not in r and r.get("is_thematic")]
+
+    n = max((len(thematic(rows)) for rows in run["systems"].values()), default=0)
+    print("\n" + "=" * 76)
+    print(f"BUSINESS PANEL — corpus-wide / read-wide questions only (n={n})")
+    print("=" * 76)
+    hdr = f"{'metric':<34}" + "".join(f"{s[:18]:>20}" for s in run["systems"])
+    print(hdr); print("-" * len(hdr))
+
+    def line(label, fn):
+        row = f"{label:<34}"
+        for s in run["systems"]:
+            v = fn(thematic(run["systems"][s]))
+            row += f"{('—' if v is None else v):>20}"
+        print(row)
+
+    line("Count accuracy % (exact nums)", lambda ok: _pct([r.get("count_acc") for r in ok]))
+    line("Corpus breadth (median docs)", lambda ok: _median([r.get("breadth") for r in ok]))
+    line("Corpus breadth (max docs)", lambda ok: max([r.get("breadth", 0) for r in ok] or [None]))
+    line("Must-have recall % (avg)", lambda ok: _pct([r["recall"] for r in ok]))
+    line("All-required-hit rate %", lambda ok: _pct([r["all_hit"] for r in ok]))
+    if any("completeness" in r for rows in run["systems"].values() for r in thematic(rows)):
+        line("Completeness % (key facts)", lambda ok: _pct([r.get("completeness") for r in ok]))
+        line("Faithful % (no hallucination)", lambda ok: _pct([r.get("faithful") for r in ok]))
+    print("\nCount accuracy & corpus breadth are the graph-exclusive read-wide metrics: "
+          "flat RAG is capped at its top-K window, so it cannot count corpus-wide or "
+          "ground on the full relevant set. (Count match is numeric-within-tolerance; "
+          "treat as directional.)")
+
+
 # ── CSV export ────────────────────────────────────────────────────────────────
 # Aggregate metrics, defined once so the summary CSV and the scorecard agree.
 SUMMARY_METRICS = [
     ("intent_accuracy_pct",   lambda ok: _pct([r["intent_ok"] for r in ok])),
+    ("count_accuracy_pct",    lambda ok: _pct([r.get("count_acc") for r in ok])),
+    ("corpus_breadth_median", lambda ok: _median([r.get("breadth") for r in ok])),
     ("must_have_recall_pct",  lambda ok: _pct([r["recall"] for r in ok])),
     ("all_required_hit_pct",  lambda ok: _pct([r["all_hit"] for r in ok])),
     ("precision_pct",         lambda ok: _pct([r["precision"] for r in ok])),
@@ -264,6 +344,7 @@ SUMMARY_METRICS = [
 
 DETAIL_COLS = [
     "system", "id", "question", "expected_intents", "predicted_intent", "intent_ok",
+    "is_thematic", "count_acc", "breadth",
     "recall", "all_hit", "precision", "latency_s", "graph_walk_s", "must_abstain",
     "faithful", "completeness", "abstained", "n_retrieved", "retrieved_docs",
     "must_have_docs", "error",
@@ -279,12 +360,13 @@ def write_csv(run: Dict, stamp: str):
         for sysname, rows in run["systems"].items():
             for r in rows:
                 if "error" in r:
-                    w.writerow([sysname, r.get("id", "")] + [""] * 16 + [r["error"]])
+                    w.writerow([sysname, r.get("id", "")] + [""] * (len(DETAIL_COLS) - 3) + [r["error"]])
                     continue
                 w.writerow([
                     sysname, r["id"], r.get("question", ""),
                     "|".join(r.get("category_intents", [])), r.get("intent_pred", ""),
-                    r.get("intent_ok"), r.get("recall"), r.get("all_hit"), r.get("precision"),
+                    r.get("intent_ok"), r.get("is_thematic"), r.get("count_acc"), r.get("breadth"),
+                    r.get("recall"), r.get("all_hit"), r.get("precision"),
                     r.get("latency"), r.get("graph_latency"), r.get("must_abstain"),
                     r.get("faithful"), r.get("completeness"), r.get("abstained"),
                     r.get("n_retrieved"), "|".join(r.get("retrieved", [])),
