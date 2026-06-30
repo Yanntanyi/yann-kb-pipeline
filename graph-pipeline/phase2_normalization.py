@@ -78,6 +78,70 @@ Return ONLY the JSON object, no explanations."""
             # Fallback: identity mapping so the pipeline can continue
             return {entity: entity for entity in unique_entities}
 
+    # ── Curated list-field normalization (components / teams) ─────────────────
+    # The dedicated components/teams fields feed the semantic-layer Component/Team
+    # nodes. Their counts must be exact, so the same real-world thing has to become
+    # one node — and the corpus fragments word-level ("EM Team" vs "IBM EM Team",
+    # "VoiceGateway" vs "IBM Voice Gateway") which deterministic de-dup can't merge.
+    # We reuse the same LLM alias resolution used for entities, sorting names first
+    # so lexically-similar aliases cluster into the same batch.
+
+    def normalize_names_batch(self, names: List[str], kind: str = "names") -> Dict[str, str]:
+        """LLM alias resolution for a batch of bare names (no entity-type suffix)."""
+        uniq = list(dict.fromkeys(n for n in names if n and str(n).strip()))
+        if not uniq:
+            return {}
+        prompt = f"""You are normalizing {kind} so different spellings of the SAME real-world thing map to one canonical name.
+
+Names:
+{json.dumps(uniq, indent=2)}
+
+Rules:
+1. Map spellings/abbreviations of the same thing to ONE canonical name
+   (e.g. "EM Team", "IBM EM Team", "IBM EM" -> "IBM EM Team";
+    "VoiceGateway", "IBM Voice Gateway" -> "IBM Voice Gateway").
+2. Use the clearest, most complete form as the canonical name.
+3. Keep genuinely different things separate.
+
+Return ONLY valid JSON mapping each input name to its canonical form:
+{{"name_1": "canonical_1", "name_2": "canonical_1"}}
+
+Return ONLY the JSON object, no explanations."""
+        try:
+            return self.llm.generate_json(prompt)
+        except Exception as e:
+            print(f"  Error normalizing {kind}: {str(e)}")
+            return {n: n for n in uniq}
+
+    def normalize_list_field(self, extractions: Dict[str, Any], field: str) -> Dict[str, str]:
+        """Build a raw->canonical map for a list field across the whole corpus."""
+        names: List[str] = []
+        for doc_data in extractions.values():
+            names.extend(doc_data["extraction"].get(field) or [])
+        # Sort so similar spellings land in the same 30-item batch (batching can't
+        # merge aliases that never appear together).
+        uniq = sorted(dict.fromkeys(n for n in names if n and str(n).strip()),
+                      key=lambda s: str(s).casefold())
+        print(f"Normalizing {len(uniq)} unique '{field}' values...")
+        mapping: Dict[str, str] = {}
+        for i in range(0, len(uniq), 30):
+            mapping.update(self.normalize_names_batch(uniq[i:i + 30], kind=field))
+        self._save_field_mapping(field, mapping)
+        return mapping
+
+    def _save_field_mapping(self, field: str, mapping: Dict[str, str]):
+        path = config.STAGING_DIR / f"phase2_{field}_normalized.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2)
+        print(f"Saved {field} normalization to {path}")
+
+    def load_field_normalization(self, field: str) -> Dict[str, str]:
+        path = config.STAGING_DIR / f"phase2_{field}_normalized.json"
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def normalize_all_entities(self, extractions: Dict[str, Any]) -> Dict[str, str]:
         """Normalize all entities across all documents, processing in batches."""
         print("Collecting all entities...")
@@ -128,25 +192,44 @@ Return ONLY the JSON object, no explanations."""
     # ── Apply normalization ───────────────────────────────────────────────────
 
     def apply_normalization(
-        self, extractions: Dict[str, Any], entity_mapping: Dict[str, str]
+        self,
+        extractions: Dict[str, Any],
+        entity_mapping: Dict[str, str],
+        field_mappings: Dict[str, Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Return a new extractions dict with raw entity strings replaced by canonical ones.
+        """Return a new extractions dict with raw strings replaced by canonical ones.
+
+        Always canonicalizes `entities`. `field_mappings` (e.g. {"components": {...},
+        "teams": {...}}) additionally canonicalizes those list fields so the
+        semantic-layer nodes built in Phase 5 are de-duplicated.
 
         Uses deepcopy so the original extractions dict is never mutated — the
         shallow copy in the original code caused silent in-place modification.
         """
+        field_mappings = field_mappings or {}
         normalized_extractions: Dict[str, Any] = {}
 
         for doc_hash, doc_data in extractions.items():
             normalized_data = copy.deepcopy(doc_data)
+            extraction = normalized_data["extraction"]
 
-            canonical_entities = list(
+            extraction["entities"] = list(
                 set(
                     entity_mapping.get(entity, entity)
-                    for entity in doc_data["extraction"]["entities"]
+                    for entity in extraction["entities"]
                 )
             )
-            normalized_data["extraction"]["entities"] = canonical_entities
+
+            # De-duplicate canonicalized list fields while preserving order.
+            for field, mapping in field_mappings.items():
+                seen, canon = set(), []
+                for v in extraction.get(field) or []:
+                    cv = mapping.get(v, v)
+                    if cv not in seen:
+                        seen.add(cv)
+                        canon.append(cv)
+                extraction[field] = canon
+
             normalized_extractions[doc_hash] = normalized_data
 
         return normalized_extractions
