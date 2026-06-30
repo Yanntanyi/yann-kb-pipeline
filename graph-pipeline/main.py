@@ -28,20 +28,17 @@ def fmt_duration(seconds: float) -> str:
     return str(timedelta(seconds=round(seconds)))
 
 
-def _fresh_start():
-    """Clear all staged phase outputs and wipe the Neo4j graph.
-
-    Required when the extraction schema or relationship ontology changes: Phase 4
-    resumes from its staging file (doc hashes are stable, so it would skip every
-    pair and silently reuse the old ontology), and Phase 5 writes with MERGE (so
-    old nodes/edges/properties would linger). A from-scratch run avoids both.
-    """
+def _clear_staging():
+    """Delete all staged phase outputs so every phase recomputes from scratch."""
     import config
-    removed = 0
-    for f in config.STAGING_DIR.glob("*.json"):
-        f.unlink()
-        removed += 1
+    removed = sum(1 for f in config.STAGING_DIR.glob("*.json") if f.unlink() or True)
     print(f"  Cleared {removed} staged file(s) from {config.STAGING_DIR}")
+
+
+def _wipe_graph():
+    """Wipe the Neo4j graph. Phase 5 writes with MERGE and never deletes, so any
+    rebuild that changes nodes/edges (new ontology, re-normalized entities) needs
+    this first or it leaves stale nodes/edges behind."""
     try:
         handler = Neo4jHandler()
         handler.clear_graph()
@@ -51,7 +48,7 @@ def _fresh_start():
         print(f"  WARNING: could not wipe Neo4j ({e}). Clear it manually before Phase 5.")
 
 
-def run_pipeline(from_phase: int = 1, fresh: bool = False):
+def run_pipeline(from_phase: int = 1, fresh: bool = False, wipe: bool = False):
     total_start = time.time()
 
     print("=" * 60)
@@ -63,7 +60,13 @@ def run_pipeline(from_phase: int = 1, fresh: bool = False):
             print("ERROR: --fresh starts from scratch; it can't be combined with --from-phase > 1.")
             sys.exit(1)
         print("\n--fresh: clearing staging + wiping Neo4j for a from-scratch rebuild...")
-        _fresh_start()
+        _clear_staging()
+        _wipe_graph()
+    elif wipe:
+        # Graph-only wipe: reuse the expensive staging (Phase 1/4), but rebuild the
+        # graph clean — e.g. after changing Phase 2 normalization or Phase 5.
+        print("\n--wipe: wiping Neo4j (keeping staging) for a clean graph rebuild...")
+        _wipe_graph()
 
     if from_phase > 1:
         print(f"\nResuming from Phase {from_phase} — loading staged results...\n")
@@ -205,5 +208,12 @@ if __name__ == "__main__":
              "first. REQUIRED after a schema or relationship-ontology change, so "
              "Phase 4 re-scores (instead of resuming) and no stale nodes/edges remain.",
     )
+    parser.add_argument(
+        "--wipe",
+        action="store_true",
+        help="Wipe the Neo4j graph but KEEP staging, then run. Use with --from-phase "
+             "after a Phase 2 normalization or Phase 5 change, to rebuild the graph "
+             "clean while reusing the expensive Phase 1/4 staging.",
+    )
     args = parser.parse_args()
-    run_pipeline(from_phase=args.from_phase, fresh=args.fresh)
+    run_pipeline(from_phase=args.from_phase, fresh=args.fresh, wipe=args.wipe)
