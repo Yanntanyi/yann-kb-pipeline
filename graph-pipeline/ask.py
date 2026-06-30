@@ -49,8 +49,17 @@ def _format_timing(timing: Dict[str, float]) -> str:
 
 # ── Traversal parameters ──────────────────────────────────────────────────────
 
-MAX_DOCS = 10  # maximum documents to collect (config.NUM_SEEDS anchors + graph hops)
-MAX_HOPS = 7   # maximum graph edges followed beyond the seeds
+MAX_DOCS = 10  # (legacy best-first walk) maximum documents to collect
+MAX_HOPS = 7   # (legacy best-first walk) maximum graph edges followed beyond seeds
+
+# ── Augment-not-replace retrieval (the four traversal intents) ────────────────
+# The graph AUGMENTS search instead of competing with it for a fixed doc budget —
+# which is what dissolves the goal-blind walk. We keep the full RAG top-K as the
+# base (never evicted, so retrieval can't do worse than flat RAG), then ADD a few
+# graph bridges: documents 1 hop from the base via the intent's typed edges, each
+# carrying the edge description that justifies it (the audit trail).
+AUGMENT_BASE_K = 10  # RAG top-K base — always kept (matches flat-RAG TOP_K)
+MAX_BRIDGES = 5      # graph bridges added on top of the base
 # Balance note: keep NUM_SEEDS (config.py) well below MAX_DOCS so the walk has room
 # to traverse. With NUM_SEEDS=3 and these values the walk can take up to 7 hops; if
 # NUM_SEEDS is near MAX_DOCS (e.g. 5/6) the seeds eat the budget and traversal barely
@@ -89,7 +98,11 @@ VALID_INTENTS = set(EDGE_PRIORITIES) | {"thematic"}
 # graph already did the expensive reading at build time.
 THEMATIC_TOP_N = 12        # entities returned by an entity_count aggregation
 THEMATIC_MAX_DOCS = 50     # documents summarised for a theme_synthesis (no walk cap)
-THEMATIC_ANSWER_TOKENS = 1536  # answer budget — output is a list/count, not an essay
+THEMATIC_ANSWER_TOKENS = 4096  # max_tokens is a CEILING, not a target: the prompt
+# still asks for a short list/count, so answers stay concise. gpt-oss is a reasoning
+# model whose hidden "thinking" tokens count against max_tokens, so a tight budget can
+# be wholly consumed by reasoning and return empty content. The headroom feeds the
+# reasoning scratchpad, not the visible answer.
 
 # Strong corpus-wide markers. These only PROMOTE an otherwise single-incident
 # classification to 'thematic' (never the reverse), as a backstop for the case the
@@ -194,21 +207,22 @@ Return ONLY valid JSON:
 
     # ── Step 2: Seed document selection ──────────────────────────────────────
 
-    def find_seeds(self, query: str) -> List[Dict[str, Any]]:
-        """Return the top NUM_SEEDS starting documents for traversal.
+    def find_seeds(self, query: str, size: int = None) -> List[Dict[str, Any]]:
+        """Return the top `size` documents (default NUM_SEEDS) by hybrid retrieval.
 
         Primary path is Elasticsearch hybrid retrieval (BM25 + dense kNN fused
-        with RRF). Using several seeds instead of one makes traversal robust to
-        a single bad seed. Falls back to a single TF-IDF seed if ES is disabled,
-        unreachable, or returns nothing.
+        with RRF). For augment-not-replace this returns the full RAG top-K base;
+        for the legacy walk it returns a few seeds. Falls back to a single TF-IDF
+        seed if ES is disabled, unreachable, or returns nothing.
         """
+        size = size or config.NUM_SEEDS
         if self.es is not None:
             try:
                 query_vector = None
                 if config.ES_USE_DENSE:
                     query_vector = self.llm.embed([query])[0]
 
-                seeds = self.es.hybrid_search(query, query_vector, size=config.NUM_SEEDS)
+                seeds = self.es.hybrid_search(query, query_vector, size=size)
                 if seeds:
                     return seeds
                 print("  ES returned no hits — falling back to TF-IDF seed.")
@@ -386,6 +400,63 @@ Return ONLY valid JSON:
                 )
                 counter += 1
 
+        return path
+
+    def augment_bridges(
+        self, base: List[Dict[str, Any]], intent: str
+    ) -> List[Dict[str, Any]]:
+        """Augment-not-replace: keep the full RAG base, then ADD graph bridges.
+
+        The base (RAG top-K) is always kept — so retrieval is never worse than flat
+        RAG. We then collect documents one hop from ANY base doc along the intent's
+        typed edges and add the strongest few as extra, framed context. A document
+        reached from MULTIPLE base docs is a stronger bridge (the lite version of
+        "connect-the-base"), so it is preferred. There is no deep best-first walk,
+        so there is no goal-blind wandering — the graph only contributes connections
+        that hang off the query-grounded base.
+        """
+        base_hashes = {d["hash"] for d in base}
+        edge_types = EDGE_PRIORITIES.get(intent, [])
+        priority_rank = {t: i for i, t in enumerate(edge_types)}
+        off_plan = len(edge_types)
+
+        # Gather 1-hop neighbors of the whole base, deduped by neighbor, counting
+        # how many base docs each connects to and keeping its strongest edge.
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for doc in base:
+            for nb in self.get_neighbors(doc["hash"], base_hashes):
+                cur = candidates.get(nb["neighbor_hash"])
+                if cur is None:
+                    cand = dict(nb)
+                    cand["connects"] = 1
+                    candidates[nb["neighbor_hash"]] = cand
+                else:
+                    cur["connects"] += 1
+                    if nb["strength"] > cur["strength"]:
+                        cur["strength"] = nb["strength"]
+                        cur["rel_type"] = nb["rel_type"]
+                        cur["description"] = nb["description"]
+
+        # Rank: on-plan edge types first, then more base-connections, then strength.
+        ranked = sorted(
+            candidates.values(),
+            key=lambda c: (priority_rank.get(c["rel_type"], off_plan),
+                           -c["connects"], -c["strength"]),
+        )
+
+        path: List[Dict[str, Any]] = [
+            {"hash": d["hash"], "filepath": d["filepath"],
+             "edge_description": None, "is_seed": True}
+            for d in base
+        ]
+        for c in ranked[:MAX_BRIDGES]:
+            path.append({
+                "hash": c["neighbor_hash"],
+                "filepath": c["filepath"],
+                "edge_description": c["description"],
+                "rel_type": c["rel_type"],
+                "is_seed": False,
+            })
         return path
 
     # ── Step 4: Context building ──────────────────────────────────────────────
@@ -665,7 +736,9 @@ Exact document-mention counts{scope}, highest first:
 {table}
 
 Write a brief, direct answer (1-3 sentences or a short ranked list) grounded in these exact numbers, naming the top entities and their counts. Lead with the answer; no preamble. You may use light Markdown (**bold**, "- " bullets). Do not invent or recompute any numbers beyond those given. Output only the answer, not your reasoning."""
-        return self.llm.generate_text(prompt, max_tokens=1024)
+        # Headroom for gpt-oss reasoning tokens (see THEMATIC_ANSWER_TOKENS note);
+        # the prompt keeps the visible answer to a short ranked list.
+        return self.llm.generate_text(prompt, max_tokens=THEMATIC_ANSWER_TOKENS)
 
     def answer_theme_synthesis(
         self, query: str, theme: Any, context: str, filepaths: List[str]
@@ -792,9 +865,9 @@ Answer:"""
             return result
 
         with _timed(timing, "seeds"):
-            seeds = self.find_seeds(query)
+            base = self.find_seeds(query, size=AUGMENT_BASE_K)
         with _timed(timing, "traverse"):
-            path = self.traverse(seeds, intent)
+            path = self.augment_bridges(base, intent)
         with _timed(timing, "context"):
             context = self.build_context(path)
         with _timed(timing, "answer"):
@@ -806,7 +879,7 @@ Answer:"""
             "intent": intent,
             "intent_description": INTENT_DESCRIPTIONS.get(intent, ""),
             "edge_priority": EDGE_PRIORITIES.get(intent, []),
-            "seeds": [s["filepath"] for s in seeds],
+            "seeds": [d["filepath"] for d in base],
             "path": [
                 {
                     "filepath": node["filepath"],
