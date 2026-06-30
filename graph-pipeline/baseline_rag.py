@@ -61,11 +61,7 @@ Question: {query}
 Documents:
 {context}
 
-Instructions:
-- Lead with the direct answer; no preamble. Be concise.
-- Cite specific document names, dates, and components where they matter.
-- If the documents don't fully answer the question, say so. Do not introduce outside information.
-- Output only the final answer, not your reasoning.
+{config.ANSWER_INSTRUCTIONS}
 
 Answer:"""
         return self.llm.generate_text(prompt, max_tokens=4096)
