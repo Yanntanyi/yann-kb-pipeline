@@ -501,16 +501,10 @@ The question is asking about {intent_desc}.
 
 Question: {query}
 
-Documents (in traversal order — each is labeled with why it was retrieved):
+Documents (in retrieval order — each is labeled with why it was retrieved):
 {context}
 
-Instructions:
-- Lead with the direct answer in the first sentence. No preamble, no restating the question.
-- Be concise — include only what answers the question. Prefer a short paragraph or a few tight bullet points; do NOT pad with background the user didn't ask for.
-- Cite specific document names, dates, and components where they matter.
-- You may use light Markdown (**bold** for key terms, "- " bullets); it will be rendered.
-- If the documents don't fully answer the question, say so briefly. Do not introduce outside information.
-- Output only the final answer, not your reasoning.
+{config.ANSWER_INSTRUCTIONS}
 
 Answer:"""
 
@@ -692,6 +686,38 @@ Return ONLY valid JSON:
             limit=limit,
         )
 
+    def gather_all_rows(self) -> List[Dict[str, Any]]:
+        """Every Document's fingerprint (no theme filter) — the breadth set for
+        counting/patterns. Theme-keyword matching is intentionally dropped: it
+        polluted the set with unrelated CRs whose topics happened to contain the
+        theme word, which then crowded out the real incident docs."""
+        return self.neo4j.query_graph(
+            """
+            MATCH (d:Document)
+            RETURN d.filepath AS filepath, d.date AS date, d.doc_type AS doc_type,
+                   d.topics AS topics, d.entities AS entities,
+                   d.components AS components, d.teams AS teams,
+                   d.root_cause AS root_cause, d.resolution AS resolution,
+                   d.status AS status, d.customer_impact AS customer_impact
+            ORDER BY d.date DESC, d.filepath
+            """
+        )
+
+    def crs_connected_to_incidents(self) -> Set[str]:
+        """Filepaths of CRs the graph links to an RCA by any Document-Document edge —
+        the changes that caused, remediated, preceded, or otherwise relate to an
+        incident. These are the 'directly relevant' CRs read in full text alongside
+        the RCAs (MENTIONS edges end at Entity nodes, so they don't match here)."""
+        rows = self.neo4j.query_graph(
+            """
+            MATCH (cr:Document)-[]-(rca:Document)
+            WHERE toLower(cr.filepath)  STARTS WITH 'cr/'
+              AND toLower(rca.filepath) STARTS WITH 'rca/'
+            RETURN DISTINCT cr.filepath AS filepath
+            """
+        )
+        return {r["filepath"] for r in rows}
+
     def _build_thematic_context(self, rows: List[Dict[str, Any]]) -> str:
         """Build a compact digest (one block per doc) from each node's stored
         incident facts. With the domain schema the block now carries root_cause,
@@ -866,15 +892,32 @@ Answer:"""
             plan = {"mode": "theme_synthesis", "entity_type": None,
                     "theme": plan.get("entity_type")}
 
+        # RCA-anchored hybrid read. The incident reports (RCAs) are the ground truth
+        # for incident questions, so ALL of them are read in FULL TEXT, plus the CRs
+        # the graph connects to an incident (the relevant changes). Everything else
+        # is a compact fingerprint for breadth/counting. This replaces theme-keyword
+        # gathering, which polluted the full-text slots with unrelated CRs and pushed
+        # the real RCAs down into lossy fingerprints (the cause of low completeness).
         with _timed(timing, "gather"):
-            rows = self.gather_thematic_set(plan.get("theme"))
-        filepaths = [r["filepath"] for r in rows]
-        # Hybrid read: full text for the most query-relevant docs (depth), compact
-        # fingerprints for the rest of the matching set (breadth/counting).
-        with _timed(timing, "rank"):
-            ranked = self._rank_rows_by_relevance(query, rows)
-        deep_rows = ranked[:THEMATIC_FULLTEXT_N]
-        rest_rows = ranked[THEMATIC_FULLTEXT_N:]
+            all_rows = self.gather_all_rows()
+            connected = self.crs_connected_to_incidents()
+        filepaths = [r["filepath"] for r in all_rows]
+
+        def _is_rca(r):
+            return str(r["filepath"]).lower().startswith("rca/")
+
+        rca_rows = [r for r in all_rows if _is_rca(r)]
+        cr_rows = [r for r in all_rows
+                   if not _is_rca(r) and r["filepath"] in connected]
+        # RCAs are always read in full; bound the connected CRs read in full by
+        # relevance so the full-text block stays a reasonable size.
+        if len(cr_rows) > THEMATIC_FULLTEXT_N:
+            with _timed(timing, "rank"):
+                cr_rows = self._rank_rows_by_relevance(query, cr_rows)[:THEMATIC_FULLTEXT_N]
+        deep_rows = rca_rows + cr_rows
+        deep_paths = {r["filepath"] for r in deep_rows}
+        rest_rows = [r for r in all_rows if r["filepath"] not in deep_paths]
+
         fulltext = self._read_fulltext([r["filepath"] for r in deep_rows])
         summaries = self._build_thematic_context(rest_rows)
         with _timed(timing, "answer"):
