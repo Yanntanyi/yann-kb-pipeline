@@ -1,7 +1,7 @@
 """Phase 1: Independent document extraction.
 
-Reads every .md file under DOCUMENTS_DIR, extracts entities/topics/stance/date
-from each one in isolation using the LLM, and saves the results to staging.
+Reads every .md file under DOCUMENTS_DIR, extracts a structured INCIDENT-DOMAIN
+fingerprint from each one in isolation using the LLM, and saves to staging.
 
 Key design choices carried over from suhas-pipeline:
   - Content-based SHA-256 hashing for deduplication (same content = same hash,
@@ -9,9 +9,18 @@ Key design choices carried over from suhas-pipeline:
   - Each document is processed independently — no cross-referencing — to prevent
     first-mover bias in entity vocabulary
 
-New in yann-pipeline:
-  - 'date' field added to extraction (YYYY-MM-DD or null)
-    This feeds Phase 5's temporal edge construction (PRECEDED_BY edges)
+Domain schema (replaces the generic entities/topics/stance/date schema):
+  The corpus is RCAs (incidents) and CRs (changes), not generic documents, so we
+  extract the fields the business and technical questions actually pivot on —
+  doc_type, root_cause, resolution, status, customer_impact, components, teams,
+  severity, tickets — alongside the entities/topics/date the graph already used.
+  This is what lets the corpus-wide (thematic) path answer "contributing factors /
+  resolution / who was involved / which are still open" from the node itself
+  instead of from bare topic tags. The old generic 'stance' field is dropped.
+
+  'date' (YYYY-MM-DD or null) still feeds Phase 5's PRECEDED_BY temporal edges;
+  most of today's corpus is dateless, but new documents are expected to carry
+  dates, so the temporal machinery stays.
 """
 
 import json
@@ -35,31 +44,46 @@ class DocumentExtractor:
         """SHA-256 hash of raw document text, used as the document's unique ID."""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+    # Fields stored on each node. List fields default to [], scalars to None.
+    LIST_FIELDS = ("entities", "topics", "components", "teams", "tickets")
+    SCALAR_FIELDS = ("doc_type", "title", "root_cause", "resolution", "status",
+                     "customer_impact", "severity")
+
     def extract_from_document(self, filepath: Path, content: str) -> Dict[str, Any]:
-        """Ask the LLM to extract a structured fingerprint from one document."""
-        prompt = f"""Analyze the following document and extract structured information. Return ONLY valid JSON with no additional text.
+        """Ask the LLM to extract a structured incident-domain fingerprint."""
+        prompt = f"""You are analyzing one document from an SRE incident knowledge base. The corpus is Root Cause Analyses (RCAs, i.e. incidents) and Change Requests (CRs, i.e. changes). Extract structured information and return ONLY valid JSON with no additional text.
 
 Document content:
 {content}
 
-Extract the following and return as JSON:
+Return JSON with exactly these fields:
 {{
-  "entities": ["list of named entities with their types, format as 'EntityName (Type)' where Type is one of: person, technology, concept, event, organization, location, other"],
-  "topics": ["list of 3-5 primary topics or themes"],
-  "stance": "one of: descriptive, argumentative, instructional, analytical, narrative",
-  "date": "the document date in YYYY-MM-DD format, or null if no date is found"
+  "doc_type": "one of: incident, change  (incident = an RCA / post-incident report; change = a change request / CR)",
+  "title": "a concise human-readable title for this document",
+  "entities": ["named entities as 'EntityName (Type)', where Type is one of: person, technology, concept, event, organization, location, other"],
+  "topics": ["3-5 primary topics or themes"],
+  "date": "the primary document date as YYYY-MM-DD, or null if none is stated",
+  "components": ["specific systems/services/clusters/components affected or changed, e.g. 'Voice Gateway', 'cert-manager', 'MCOG', 'wa-incoming-webhooks'"],
+  "teams": ["teams, organizations, or named people involved, e.g. 'IBM EM Team', 'Red Hat', 'UPS Voice'"],
+  "root_cause": "for an incident: ONE sentence stating the underlying root cause. null for a change.",
+  "resolution": "how the incident was resolved/remediated, or what the change accomplished. null if not stated.",
+  "status": "one of: resolved, open, unknown — whether the incident is fully resolved; for a completed change use 'resolved'",
+  "customer_impact": "for an incident: a short phrase capturing customer impact (calls affected, outage duration, channel Voice/Digital). null if none or not stated.",
+  "severity": "the severity if stated (e.g. 'Sev1', 'Sev2'), else null",
+  "tickets": ["any case/ticket/reference IDs mentioned, e.g. 'TS020583334', 'RedHat 04271299'"]
 }}
 
-Return ONLY the JSON object, no explanations."""
+Be specific and grounded in the document — do not invent values. Use null (or []) for anything the document does not state. Return ONLY the JSON object, no explanations."""
 
         try:
             result = self.llm.generate_json(prompt)
 
-            # entities / topics / stance are required; date is optional
-            required_fields = ["entities", "topics", "stance"]
-            for field in required_fields:
+            # entities / topics / doc_type are required; the rest are optional.
+            for field in ("entities", "topics", "doc_type"):
                 if field not in result:
                     raise ValueError(f"Missing required field: {field}")
+
+            result = self._normalize_fields(result)
 
             # Deterministic date overlay: filename-authoritative, keep a good LLM
             # date, else fall back to a body date. The LLM only sees the body and
@@ -71,12 +95,20 @@ Return ONLY the JSON object, no explanations."""
 
         except Exception as e:
             print(f"  Error extracting from {filepath.name}: {str(e)}")
-            return {
-                "entities": [],
-                "topics": ["unknown"],
-                "stance": "descriptive",
-                "date": resolve_date(filepath.name, content, None),
-            }
+            fallback = self._normalize_fields({"topics": ["unknown"], "doc_type": "unknown"})
+            fallback["date"] = resolve_date(filepath.name, content, None)
+            return fallback
+
+    def _normalize_fields(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Guarantee every schema field exists with the right shape (list vs scalar),
+        so downstream phases and the Neo4j node never hit a missing key."""
+        for f in self.LIST_FIELDS:
+            v = result.get(f)
+            result[f] = v if isinstance(v, list) else ([] if v in (None, "") else [v])
+        for f in self.SCALAR_FIELDS:
+            v = result.get(f)
+            result[f] = v if (v not in ("", "null", "none")) else None
+        return result
 
     def process_all_documents(self) -> Dict[str, Dict[str, Any]]:
         """Process all .md files under DOCUMENTS_DIR (recursive — finds CR/ and RCA/)."""
