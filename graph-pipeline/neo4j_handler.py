@@ -20,16 +20,20 @@ from neo4j import GraphDatabase
 
 import config
 
-# The only relationship types the LLM is allowed to produce.
-# Any other string is coerced to RELATED_TO before hitting Neo4j.
+# The only Document→Document relationship types the LLM (Phase 4) is allowed to
+# produce. Any other string is coerced to RELATED_TO before hitting Neo4j.
+# Incident-domain ontology: the types that map to how SREs actually reason about
+# incidents and changes. The old generic set (EXTENDS/SUPPORTS/SHARES_DOMAIN_WITH/
+# IMPLEMENTS/CONTRADICTS) was dropped — SHARES_DOMAIN_WITH in particular linked
+# everything in a tech area, manufacturing the over-connected hubs that made the
+# traversal goal-blind. (MENTIONS and PRECEDED_BY are created structurally in
+# Phase 5, not by the LLM, so they are not in this whitelist.)
 VALID_REL_TYPES = {
-    "EXTENDS",
-    "CONTRADICTS",
-    "SUPPORTS",
-    "REFERENCES",
-    "PROVIDES_CONTEXT_FOR",
-    "SHARES_DOMAIN_WITH",
-    "IMPLEMENTS",
+    "CAUSED_BY",            # a change/event caused the problem in the other doc
+    "REMEDIATED_BY",        # the other doc is the change/action that fixed this one
+    "RECURRENCE_OF",        # same underlying failure mode recurring
+    "REFERENCES",           # one doc explicitly cites/links the other
+    "PROVIDES_CONTEXT_FOR", # one gives background needed to understand the other
 }
 
 
@@ -55,6 +59,16 @@ class Neo4jHandler:
                 "CREATE CONSTRAINT entity_name IF NOT EXISTS "
                 "FOR (e:Entity) REQUIRE e.name IS UNIQUE"
             )
+            # Semantic layer: Component / Team as first-class nodes (the read-wide
+            # pivots — "which component fails most", "which team is engaged most").
+            session.run(
+                "CREATE CONSTRAINT component_name IF NOT EXISTS "
+                "FOR (c:Component) REQUIRE c.name IS UNIQUE"
+            )
+            session.run(
+                "CREATE CONSTRAINT team_name IF NOT EXISTS "
+                "FOR (t:Team) REQUIRE t.name IS UNIQUE"
+            )
 
     # ── Document nodes ────────────────────────────────────────────────────────
 
@@ -62,32 +76,32 @@ class Neo4jHandler:
         self,
         doc_hash: str,
         filepath: str,
-        entities: List[str],
-        topics: List[str],
-        stance: str,
-        date: Optional[str] = None,
+        properties: Dict[str, Any],
     ):
-        """Create or update a Document node.
+        """Create or update a Document node from a Phase 1 extraction map.
 
-        'date' is stored as a string (YYYY-MM-DD) so Neo4j doesn't need
-        temporal types — Phase 5 does all date arithmetic in Python.
+        Every key in `properties` (entities, topics, date, doc_type, root_cause,
+        resolution, status, customer_impact, components, teams, severity, …) is
+        written as a node property via `SET d += $props`. This is future-proof:
+        add a field to the Phase 1 schema and it lands on the node with no change
+        here. List values store as string arrays; None values are skipped (Neo4j
+        treats a null in a `+=` map as "remove that property").
+
+        Dates are stored as strings (YYYY-MM-DD) so Neo4j needs no temporal types —
+        Phase 5 does all date arithmetic in Python.
         """
+        props = {k: v for k, v in (properties or {}).items()
+                 if k not in ("hash", "filepath") and v is not None}
         with self.driver.session() as session:
             session.run(
                 """
                 MERGE (d:Document {hash: $hash})
-                SET d.filepath   = $filepath,
-                    d.entities   = $entities,
-                    d.topics     = $topics,
-                    d.stance     = $stance,
-                    d.date       = $date
+                SET d.filepath = $filepath
+                SET d += $props
                 """,
                 hash=doc_hash,
                 filepath=filepath,
-                entities=entities,
-                topics=topics,
-                stance=stance,
-                date=date,
+                props=props,
             )
 
     # ── Document→Document relationship edges ─────────────────────────────────
@@ -180,6 +194,44 @@ class Neo4jHandler:
                 name=name,
             )
 
+    # ── Semantic layer: Component / Team nodes (the read-wide pivots) ──────────
+
+    def create_component_node(self, name: str):
+        """Create or update a Component node (an affected/changed system)."""
+        with self.driver.session() as session:
+            session.run("MERGE (c:Component {name: $name})", name=name)
+
+    def create_team_node(self, name: str):
+        """Create or update a Team node (a team/org/person involved)."""
+        with self.driver.session() as session:
+            session.run("MERGE (t:Team {name: $name})", name=name)
+
+    def link_affects(self, doc_hash: str, name: str):
+        """Document-[:AFFECTS]->Component — this doc affected/changed this component."""
+        with self.driver.session() as session:
+            session.run(
+                """
+                MATCH (d:Document {hash: $doc_hash})
+                MATCH (c:Component {name: $name})
+                MERGE (d)-[:AFFECTS]->(c)
+                """,
+                doc_hash=doc_hash,
+                name=name,
+            )
+
+    def link_involved(self, doc_hash: str, name: str):
+        """Document-[:INVOLVED]->Team — this team/person was involved in this doc."""
+        with self.driver.session() as session:
+            session.run(
+                """
+                MATCH (d:Document {hash: $doc_hash})
+                MATCH (t:Team {name: $name})
+                MERGE (d)-[:INVOLVED]->(t)
+                """,
+                doc_hash=doc_hash,
+                name=name,
+            )
+
     # ── Temporal edges ────────────────────────────────────────────────────────
 
     def create_temporal_edge(
@@ -216,6 +268,13 @@ class Neo4jHandler:
         with self.driver.session() as session:
             result = session.run(cypher, **params)
             return [record.data() for record in result]
+
+    def clear_graph(self):
+        """Delete every node and relationship. Used by a from-scratch rebuild so a
+        schema/ontology change can't leave stale nodes, edges, or properties behind
+        (Phase 5 writes with MERGE, which never removes old data)."""
+        with self.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
