@@ -8,9 +8,9 @@ How it works:
   5. Generate a grounded answer from the ordered, framed context
 
 Usage:
-  python ask.py "What caused the CPD certificate outage?"
-  python ask.py                          (interactive mode)
-  python ask.py --from-phase 5 (not relevant here — this is a query tool, not pipeline)
+  python3 ask.py "What caused the CPD certificate outage?"
+  python3 ask.py                          (interactive mode)
+  python3 ask.py --from-phase 5 (not relevant here — this is a query tool, not pipeline)
 """
 
 import heapq
