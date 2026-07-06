@@ -8,9 +8,9 @@ How it works:
   5. Generate a grounded answer from the ordered, framed context
 
 Usage:
-  python3 ask.py "What caused the CPD certificate outage?"
-  python3 ask.py                          (interactive mode)
-  python3 ask.py --from-phase 5 (not relevant here — this is a query tool, not pipeline)
+  python ask.py "What caused the CPD certificate outage?"
+  python ask.py                          (interactive mode)
+  python ask.py --from-phase 5 (not relevant here — this is a query tool, not pipeline)
 """
 
 import heapq
@@ -102,7 +102,7 @@ THEMATIC_TOP_N = 12        # entities returned by an entity_count aggregation
 THEMATIC_MAX_DOCS = 50     # documents in the matching set for a theme_synthesis
 THEMATIC_FULLTEXT_N = 12   # of those, how many (most query-relevant) to read in FULL
                            # TEXT; the remainder are read as compact fingerprints
-THEMATIC_ANSWER_TOKENS = 4096  # max_tokens is a CEILING, not a target: the prompt
+THEMATIC_ANSWER_TOKENS = 8192  # max_tokens is a CEILING, not a target: the prompt
 # still asks for a short list/count, so answers stay concise. gpt-oss is a reasoning
 # model whose hidden "thinking" tokens count against max_tokens, so a tight budget can
 # be wholly consumed by reasoning and return empty content. The headroom feeds the
@@ -510,7 +510,7 @@ Answer:"""
 
         # Generous budget: a reasoning model spends tokens on its hidden
         # reasoning channel before the grounded answer, so leave headroom.
-        return self.llm.generate_text(prompt, max_tokens=4096)
+        return self.llm.generate_text(prompt, max_tokens=8192)
 
     # ── Thematic (corpus-wide) path ───────────────────────────────────────────
     # Aggregation/pattern questions are NOT traversals. Best-first walking from a
