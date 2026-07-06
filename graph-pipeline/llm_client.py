@@ -112,6 +112,10 @@ class WatsonxClient:
     """
 
     IAM_URL = "https://iam.cloud.ibm.com/identity/token"
+    # Upper bound for the auto-grow-on-length retry (see _chat). A reasoning model
+    # can consume the whole budget on hidden reasoning and return empty content;
+    # we double the ceiling and retry up to this cap before giving up.
+    MAX_TOKENS_CAP = 16384
 
     def __init__(self):
         self.base_url = config.WATSONX_BASE_URL.rstrip("/")
@@ -200,15 +204,23 @@ class WatsonxClient:
             choice = response.json()["choices"][0]
             content = (choice.get("message") or {}).get("content")
             if not content:
-                # gpt-oss is a reasoning model: it emits a hidden
-                # `reasoning_content` channel before the final `content`. If
-                # max_tokens is too small the reasoning consumes the whole
-                # budget and `content` comes back empty (finish_reason="length").
-                # Fail clearly instead of KeyError-ing downstream.
+                # gpt-oss is a reasoning model: it spends tokens on a hidden
+                # `reasoning_content` channel before the final `content`. If the
+                # budget is too small the reasoning consumes all of it and
+                # `content` comes back empty (finish_reason="length"). Grow the
+                # ceiling and retry so the hardest questions self-heal instead of
+                # erroring out of the run.
+                if (choice.get("finish_reason") == "length"
+                        and body["max_tokens"] < self.MAX_TOKENS_CAP
+                        and attempt < max_attempts - 1):
+                    body["max_tokens"] = min(body["max_tokens"] * 2,
+                                             self.MAX_TOKENS_CAP)
+                    continue
                 raise RuntimeError(
                     "watsonx returned empty message content "
-                    f"(finish_reason={choice.get('finish_reason')!r}). "
-                    "For reasoning models like gpt-oss, increase max_tokens."
+                    f"(finish_reason={choice.get('finish_reason')!r}) even at "
+                    f"max_tokens={body['max_tokens']}. The reasoning budget was "
+                    "exhausted; raise MAX_TOKENS_CAP or shorten the prompt."
                 )
             return content.strip()
 
