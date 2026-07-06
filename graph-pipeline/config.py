@@ -3,6 +3,14 @@
 import os
 from pathlib import Path
 
+# Load .env file if present (never committed to git — see .gitignore).
+# python-dotenv is an optional dev dependency; skip silently if not installed.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass
+
 
 def _env(*names: str, default: str = "") -> str:
     """Return the first non-empty value among the given environment variables,
@@ -113,9 +121,11 @@ ES_RRF_K = int(_env("ES_RRF_K", default="60"))
 NUM_SEEDS = int(_env("NUM_SEEDS", default="3"))
 
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password1234"  # set this to your actual Neo4j password
+# Env-overridable (via .env or shell) so the connection can be pointed at a
+# different host/credentials without editing this file.
+NEO4J_URI = _env("NEO4J_URI", default="bolt://localhost:7687")
+NEO4J_USER = _env("NEO4J_USER", default="neo4j")
+NEO4J_PASSWORD = _env("NEO4J_PASSWORD", default="password123")
 
 # ── Shared answer-generation instructions ────────────────────────────────────
 # Used by BOTH the graph system and the flat-RAG baseline so the head-to-head
@@ -126,6 +136,7 @@ NEO4J_PASSWORD = "password1234"  # set this to your actual Neo4j password
 ANSWER_INSTRUCTIONS = """Instructions:
 - Lead with the direct answer in the first sentence. No preamble, no restating the question.
 - Cover all the specific facts the question asks for — if it asks to trace a chain, give every step; if it asks for several items, include them all. Be complete, but do not pad with background the question didn't ask for.
+- Documents may carry structured or labeled fields — e.g. Risk, Severity, Priority, Status, Category, Type, Date, Component, Team — as headers, key/value lines, or front-matter, not only as prose. Read these fields as authoritative facts. Before concluding a detail (like a risk level, status, category, or date) is missing, check the labeled fields and headers; do not say the information is unavailable if it appears there.
 - Cite specific document names, dates, and components where they matter.
 - You may use light Markdown (**bold**, "- " bullets); it will be rendered.
 - If the documents don't fully answer the question, say so. Do not introduce outside information.
